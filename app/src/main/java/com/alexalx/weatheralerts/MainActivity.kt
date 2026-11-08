@@ -81,6 +81,16 @@ private fun EaaApp() {
         if (Build.VERSION.SDK_INT >= 33) permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
+    // Refresh the visible journal/cache after WorkManager has updated them in the background.
+    LaunchedEffect(tab, isWorking) {
+        if (!isWorking) {
+            while (true) {
+                delay(30_000)
+                if (!isWorking) reload()
+            }
+        }
+    }
+
     fun reload() {
         cities.clear(); cities.addAll(db.cities())
         alerts.clear(); alerts.addAll(db.activeAlerts())

@@ -326,7 +326,7 @@ object AlertEngine {
             val headline = p.optString("headline").ifBlank { event }
             val messageType = p.optString("messageType", "Alert")
             out += AlertRecord(
-                id = stableId("nws", city.name + "|" + feature.optString("id", headline + p.optString("sent"))),
+                id = stableId("nws", feature.optString("id", headline + p.optString("sent"))),
                 sourceId = "nws",
                 city = city.name,
                 event = event,
@@ -362,7 +362,7 @@ object AlertEngine {
                 val magnitude = p.optDouble("mag", 0.0)
                 val eventTime = p.optLong("time").toString()
                 out += AlertRecord(
-                    id = stableId("usgs", city.name + "|" + feature.optString("id", title)),
+                    id = stableId("usgs", feature.optString("id", title)),
                     sourceId = "usgs",
                     city = city.name,
                     event = "Earthquake M " + magnitude,
@@ -442,7 +442,7 @@ object AlertEngine {
         val details = o.toString().take(5000)
         return listOf(
             AlertRecord(
-                id = stableId("jma", city.regionCode + "|" + reportTime + "|" + headline),
+                id = stableId("jma", city.regionCode + headline + " " + reportTime),
                 sourceId = "jma",
                 city = city.name,
                 event = "JMA warning/advisory",
@@ -631,7 +631,7 @@ object AlertEngine {
                     .ifBlank { p.optString("todate") }.ifBlank { p.optString("toDate") }
                 val status = p.optString("messageType").ifBlank { p.optString("status", "Actual") }
                 out += AlertRecord(
-                    id = stableId(source, city.name + "|" + rawId),
+                    id = stableId(source, rawId),
                     sourceId = source,
                     city = city.name,
                     event = p.optString("event").ifBlank { title },

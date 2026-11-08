@@ -1,0 +1,401 @@
+package com.alexalx.weatheralerts
+
+import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.DateFormat
+import java.util.Date
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        AppContextHolder.context = applicationContext
+        AlertNotifier.ensureChannels(getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager)
+        MonitorScheduler.schedule(applicationContext)
+        setContent { EaaApp() }
+    }
+}
+
+private val appColors = darkColorScheme(
+    primary = Color(0xFF83B7FF), secondary = Color(0xFF75D6C1),
+    background = Color(0xFF0B1118), surface = Color(0xFF141E29),
+    surfaceVariant = Color(0xFF202D3B), onBackground = Color(0xFFE6EDF5),
+    onSurface = Color(0xFFE6EDF5)
+)
+
+@Composable
+private fun EaaApp() {
+    val context = LocalContext.current
+    val db = remember { LocalDatabase(context) }
+    val scope = rememberCoroutineScope()
+    var tab by remember { mutableStateOf("Alerts") }
+    var showCityDialog by remember { mutableStateOf(false) }
+    var showFeedDialog by remember { mutableStateOf(false) }
+    var isWorking by remember { mutableStateOf(false) }
+    var statusMessage by remember { mutableStateOf("Ready · manual locations only") }
+    val cities = remember { mutableStateListOf<City>().apply { addAll(db.cities()) } }
+    val alerts = remember { mutableStateListOf<AlertRecord>().apply { addAll(db.alerts()) } }
+    val probes = remember { mutableStateMapOf<String, ProbeResult>().apply { putAll(db.probes()) } }
+    val feeds = remember { mutableStateListOf<CustomFeed>().apply { addAll(db.customFeeds()) } }
+
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        statusMessage = if (granted) "Notifications enabled" else "Android notification permission denied"
+    }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33) permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    fun reload() {
+        cities.clear(); cities.addAll(db.cities())
+        alerts.clear(); alerts.addAll(db.alerts())
+        probes.clear(); probes.putAll(db.probes())
+        feeds.clear(); feeds.addAll(db.customFeeds())
+    }
+
+    MaterialTheme(colorScheme = appColors) {
+        Scaffold(
+            topBar = {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("EMERGENCY ALERT", style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                            Text("Aggregator", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                        }
+                        AssistChip(onClick = {}, label = { Text("LOCAL ONLY") })
+                    }
+                    Text(statusMessage, style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
+                }
+            },
+            bottomBar = {
+                NavigationBar {
+                    listOf("Alerts", "Cities", "Sources", "Settings").forEach { key ->
+                        NavigationBarItem(selected = tab == key, onClick = { tab = key },
+                            icon = { Text(when (key) { "Alerts" -> "◉"; "Cities" -> "⌖"; "Sources" -> "⇄"; else -> "⚙" }) },
+                            label = { Text(key) })
+                    }
+                }
+            }
+        ) { padding ->
+            Box(Modifier.padding(padding)) {
+                when (tab) {
+                    "Alerts" -> AlertsScreen(alerts, cities, isWorking,
+                        onRefresh = {
+                            scope.launch {
+                                isWorking = true
+                                statusMessage = "Polling configured sources…"
+                                val count = withContext(Dispatchers.IO) { AlertEngine.sync(context) }
+                                reload()
+                                statusMessage = "Completed · " + count + " new alerts · " + DateFormat.getTimeInstance().format(Date())
+                                isWorking = false
+                            }
+                        },
+                        onOpen = { url ->
+                            if (url.startsWith("http")) context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        })
+                    "Cities" -> CitiesScreen(cities, { showCityDialog = true }, { db.deleteCity(it); reload() })
+                    "Sources" -> SourcesScreen(probes, feeds, isWorking,
+                        onTest = {
+                            scope.launch {
+                                isWorking = true
+                                statusMessage = "Testing all public endpoints from this phone…"
+                                withContext(Dispatchers.IO) { SourceDiagnostics.runAll(context) }
+                                reload()
+                                statusMessage = "Source tests completed · " + DateFormat.getTimeInstance().format(Date())
+                                isWorking = false
+                            }
+                        },
+                        onAddFeed = { showFeedDialog = true },
+                        onDeleteFeed = { db.deleteCustomFeed(it); reload() })
+                    else -> SettingsScreen(
+                        onTestSound = { AlertNotifier.test(context, it) },
+                        onRefresh = { MonitorScheduler.runNow(context); statusMessage = "Background check queued" })
+                }
+            }
+        }
+    }
+
+    if (showCityDialog) CityDialog(
+        onDismiss = { showCityDialog = false },
+        onSave = { city -> db.saveCity(city); reload(); showCityDialog = false; statusMessage = "Added " + city.name }
+    )
+    if (showFeedDialog) FeedDialog(
+        onDismiss = { showFeedDialog = false },
+        onSave = { name, url -> db.addCustomFeed(name, url); reload(); showFeedDialog = false; statusMessage = "Custom feed added" }
+    )
+}
+
+@Composable
+private fun ScreenHeader(title: String, subtitle: String, trailing: (@Composable () -> Unit)? = null) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
+        }
+        trailing?.invoke()
+    }
+}
+
+@Composable
+private fun AlertsScreen(alerts: List<AlertRecord>, cities: List<City>, isWorking: Boolean,
+                         onRefresh: () -> Unit, onOpen: (String) -> Unit) {
+    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp).padding(top = 8.dp)) {
+        ScreenHeader("Live alert feed", cities.size.toString() + " manually selected locations") {
+            Button(onClick = onRefresh, enabled = !isWorking) { Text(if (isWorking) "Checking…" else "Check now") }
+        }
+        Spacer(Modifier.height(12.dp))
+        if (cities.isEmpty()) EmptyCard("No monitored cities", "Open Cities and add a place manually. Location permission is never requested.")
+        else if (alerts.isEmpty()) EmptyCard("No matching alerts stored", "Run a check. An empty feed does not prove that a source is healthy; inspect Sources for connection status.")
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 18.dp)) {
+            items(alerts, key = { it.id }) { alert ->
+                Card(Modifier.fillMaxWidth().clickable { onOpen(alert.url) }) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(alert.category.uppercase(), style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.weight(1f))
+                            Text(alert.severity, style = MaterialTheme.typography.labelSmall)
+                        }
+                        Text(alert.headline, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(alert.city + " · " + alert.sourceId, style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
+                        if (alert.description.isNotBlank()) Text(alert.description, style = MaterialTheme.typography.bodySmall, maxLines = 4)
+                        if (alert.url.isNotBlank()) Text("Open source ↗", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CitiesScreen(cities: List<City>, onAdd: () -> Unit, onDelete: (Long) -> Unit) {
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        ScreenHeader("Monitored cities", "No device location · manual configuration") {
+            Button(onClick = onAdd) { Text("+ Add") }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text("Add a place with a name and country; coordinates enable point/radius-based sources.", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(8.dp))
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(cities, key = { it.id }) { city ->
+                Card(Modifier.fillMaxWidth()) {
+                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(city.name, fontWeight = FontWeight.Bold)
+                            Text(listOf(city.region, city.country).filter { it.isNotBlank() }.joinToString(", "),
+                                style = MaterialTheme.typography.bodySmall)
+                            val coordinateText = if (city.latitude != null && city.longitude != null)
+                                city.latitude.toString() + ", " + city.longitude.toString() + " · " + city.radiusKm + " km radius"
+                                else "No coordinates: only name-matched feeds"
+                            Text(coordinateText, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
+                            if (city.regionCode.isNotBlank()) Text("Regional source code: " + city.regionCode, style = MaterialTheme.typography.labelSmall)
+                        }
+                        TextButton(onClick = { onDelete(city.id) }) { Text("Remove") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourcesScreen(probes: Map<String, ProbeResult>, feeds: List<CustomFeed>, isWorking: Boolean,
+                          onTest: () -> Unit, onAddFeed: () -> Unit, onDeleteFeed: (Long) -> Unit) {
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        ScreenHeader("Source diagnostics", "Tests run from this Android device") {
+            Button(onClick = onTest, enabled = !isWorking) { Text(if (isWorking) "Testing…" else "Test all") }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text("Tests make real HTTP GET requests. HTTP 403 means the host answered but denied this client; unreachable means DNS, TLS, timeout or routing failed.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
+            items(SourceCatalog.all, key = { it.id }) { source ->
+                val p = probes[source.id]
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(source.title, Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+                            val label = if (source.requiresSetup) "SETUP REQUIRED" else p?.status ?: "NOT TESTED"
+                            AssistChip(onClick = {}, label = { Text(label, style = MaterialTheme.typography.labelSmall) })
+                        }
+                        Text(source.coverage + " · " + source.format, style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary)
+                        Text(source.notes, style = MaterialTheme.typography.bodySmall)
+                        Text(source.endpoint, style = MaterialTheme.typography.labelSmall, maxLines = 2)
+                        if (p != null) {
+                            val detail = "HTTP " + (p.httpCode?.toString() ?: "—") + " · " + p.elapsedMs + " ms · " +
+                                DateFormat.getTimeInstance().format(Date(p.checkedAt)) + "\n" + p.detail
+                            Text(detail, style = MaterialTheme.typography.labelSmall,
+                                color = if (p.status == "ONLINE") MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            }
+            item {
+                ScreenHeader("Custom feeds", "Add official RSS, Atom or CAP/XML endpoints")
+                Button(onClick = onAddFeed, modifier = Modifier.fillMaxWidth()) { Text("+ Add custom feed") }
+            }
+            items(feeds, key = { "feed_" + it.id }) { feed ->
+                Card(Modifier.fillMaxWidth()) {
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(feed.name, fontWeight = FontWeight.SemiBold)
+                            Text(feed.url, style = MaterialTheme.typography.labelSmall, maxLines = 2)
+                        }
+                        TextButton(onClick = { onDeleteFeed(feed.id) }) { Text("Remove") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsScreen(onTestSound: (String) -> Unit, onRefresh: () -> Unit) {
+    val categories = listOf("Severe Storm", "Tsunami", "Earthquake", "Flood", "Wildfire",
+        "Volcano", "Radiological / Nuclear", "Chemical", "Health", "Landslide", "Avalanche",
+        "Winter Weather", "Extreme Heat", "Extreme Cold", "Air Quality", "Space Weather", "Public Safety", "Weather", "Other")
+    var selected by remember { mutableStateOf(categories.first()) }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("Settings & tools", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        EmptyCard("Local-only design", "No account, no developer server, no map and no location permission. The app polls public sources directly from your phone.")
+        Card {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Monitoring frequency", fontWeight = FontWeight.Bold)
+                Text("Background polling uses WorkManager. Android periodic work minimum is 15 minutes and execution can be delayed by Doze, battery optimization or vendor restrictions. Use Check now for an immediate request.",
+                    style = MaterialTheme.typography.bodySmall)
+                Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) { Text("Queue background check") }
+            }
+        }
+        Card {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Notification sound test", fontWeight = FontWeight.Bold)
+                Text("A local test only. It does not contact emergency authorities or represent a real alert.", style = MaterialTheme.typography.bodySmall)
+                var expanded by remember { mutableStateOf(false) }
+                Box {
+                    OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) { Text(selected) }
+                    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                        categories.forEach { item -> DropdownMenuItem(text = { Text(item) }, onClick = { selected = item; expanded = false }) }
+                    }
+                }
+                Button(onClick = { onTestSound(selected) }, modifier = Modifier.fillMaxWidth()) { Text("Send test notification") }
+            }
+        }
+        Card {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Important limitations", fontWeight = FontWeight.Bold)
+                Text("• No remote WEA cell-broadcast reception. This app reads internet feeds, not US carrier broadcasts.\n• No server means no push while Android stops the app or the phone has no network.\n• Some providers require credentials, regional codes or approval.\n• This is not a replacement for local official life-safety alerts.",
+                    style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CityDialog(onDismiss: () -> Unit, onSave: (City) -> Unit) {
+    var name by remember { mutableStateOf("") }
+    var region by remember { mutableStateOf("") }
+    var country by remember { mutableStateOf("") }
+    var lat by remember { mutableStateOf("") }
+    var lon by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    var radius by remember { mutableStateOf("300") }
+    var error by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add monitored location") },
+        text = {
+            Column(Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    AssistChip(onClick = { name="Miami"; region="Florida"; country="USA"; lat="25.7617"; lon="-80.1918" }, label = { Text("Miami preset") })
+                    AssistChip(onClick = { name="New York"; region="New York"; country="USA"; lat="40.7128"; lon="-74.0060" }, label = { Text("New York preset") })
+                }
+                OutlinedTextField(name, { name=it }, label={Text("City / place name *")}, singleLine=true)
+                OutlinedTextField(country, { country=it }, label={Text("Country *")}, singleLine=true)
+                OutlinedTextField(region, { region=it }, label={Text("State / province / region")}, singleLine=true)
+                OutlinedTextField(lat, { lat=it }, label={Text("Latitude")}, singleLine=true, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
+                OutlinedTextField(lon, { lon=it }, label={Text("Longitude")}, singleLine=true, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
+                OutlinedTextField(radius, { radius=it }, label={Text("Nearby event radius, km")}, singleLine=true, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number))
+                OutlinedTextField(code, { code=it }, label={Text("Optional regional code (e.g. JMA 130000)")}, singleLine=true)
+                Text("No GPS or device location is used. Coordinates are entered or pasted by you. Coordinates enable NWS and distance-filtered global sources.",
+                    style = MaterialTheme.typography.bodySmall)
+                if (error.isNotBlank()) Text(error, color=MaterialTheme.colorScheme.error)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val latitude = lat.toDoubleOrNull()
+                val longitude = lon.toDoubleOrNull()
+                if (name.isBlank() || country.isBlank()) error = "City and country are required."
+                else if ((lat.isNotBlank() || lon.isNotBlank()) && (latitude == null || longitude == null || latitude !in -90.0..90.0 || longitude !in -180.0..180.0))
+                    error = "Enter valid latitude and longitude."
+                else onSave(City(name=name.trim(), country=country.trim(), region=region.trim(),
+                    latitude=latitude, longitude=longitude, regionCode=code.trim(), radiusKm=(radius.toIntOrNull() ?: 300).coerceIn(1, 3000)))
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick=onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable
+private fun FeedDialog(onDismiss: () -> Unit, onSave: (String, String) -> Unit) {
+    var name by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add custom alert feed") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(name, { name=it }, label={Text("Feed name")}, singleLine=true)
+                OutlinedTextField(url, { url=it }, label={Text("HTTPS RSS / Atom / CAP URL")}, singleLine=true)
+                Text("Only add trusted sources. The app fetches this URL directly from your phone and parses standard RSS, Atom or CAP/XML entries.",
+                    style=MaterialTheme.typography.bodySmall)
+                if (error.isNotBlank()) Text(error, color=MaterialTheme.colorScheme.error)
+            }
+        },
+        confirmButton = { TextButton(onClick = {
+            if (name.isBlank() || !url.startsWith("https://")) error = "Enter a name and an HTTPS URL."
+            else onSave(name.trim(), url.trim())
+        }) { Text("Add") } },
+        dismissButton = { TextButton(onClick=onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable
+private fun EmptyCard(title: String, body: String) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(title, fontWeight = FontWeight.Bold)
+            Text(body, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f))
+        }
+    }
+}

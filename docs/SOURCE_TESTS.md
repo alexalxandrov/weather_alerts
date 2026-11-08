@@ -1,61 +1,74 @@
-# Source survey and test plan
+# Source diagnostics and validation
 
-Date of survey: 2026-11-08.
+## User-device observations (2026-11-08)
 
-This report separates endpoint/documentation inspection from live tests on the user's Android phone. The assistant environment could not resolve external hosts with its shell DNS, and the web retrieval layer rejects some XML/GeoJSON content types or receives access-denied responses. This is not evidence that the same endpoints are blocked in Russia. The app includes on-device GET probes because only the phone can measure the user's actual DNS, TLS, routing and HTTP access.
+The first on-device source test gave the following results:
 
-## Source matrix
+| Source | Reported result | Interpretation / action |
+|---|---|---|
+| USGS | HTTP 200, JSON | Reachable. GeoJSON feed is a valid data endpoint. |
+| NOAA SWPC | HTTP 200, JSON | Reachable. JSON array must be parsed as a top-level array. |
+| GDACS | HTTP 200, JSON | Reachable. Event response schema must be parsed defensively. |
+| NOAA NHC | HTTP 200, XML | Reachable. RSS/XML parser needed. |
+| Tsunami PAAQ/PHEB | HTTP 200, XML | Reachable. Atom/CAP content should be parsed as XML. |
+| JMA | HTTP 200, JSON | Reachable. Region code must match the configured Japanese area. |
+| MeteoAlarm root | HTTP 200, HTML | Not a usable feed. The directory page is not an alert feed; switch to a country-specific Atom URL. |
+| EONET GeoJSON URL | HTTP 200, RSS MIME | Response did not match the GeoJSON parser expectation. Switch to the documented Events JSON API. |
+| EMSC legacy RSS | HTTP 404, HTML | Endpoint is invalid/retired for this app. Switch to official SeismicPortal FDSN service. |
+| NWS API | timeout around 18.5 seconds | Network path did not respond in the test environment. This is not evidence that there are no active alerts. Use a short bounded diagnostic timeout and retain explicit TIMEOUT state. |
+| Nominatim | HTTP 200, JSON | Geocoder is reachable. It is not an alert source. |
+| FEMA IPAWS | setup required | No anonymous endpoint polling. Access requires FEMA IPAWS approval/agreement. |
 
-| Source | Data / categories | Endpoint used by app | Survey result from this environment | Notes |
-|---|---|---|---|---|
-| NWS API | US watches, warnings, advisories, statements; point based | api.weather.gov/alerts/active | Endpoint content type was not rendered by the browser tool; NWS API/CAP/Atom documentation verified | Requires User-Agent; point queries are per city with manually entered coordinates. |
-| USGS | Worldwide earthquakes | earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson | all_hour GeoJSON returned a valid FeatureCollection in the web retrieval environment | App currently pulls all_day, then filters by city radius. |
-| NASA EONET | Natural events: wildfires, severe storms, volcanoes and other event categories | eonet.gsfc.nasa.gov/api/v3/events/geojson | Current v3 API documentation verified; direct feed content-type was not accepted by the retrieval layer | EONET is a curated event catalogue, not a life-safety warning authority. |
-| GDACS | Global disaster event alerts | gdacs.org/gdacsapi/api/events/geteventlist/SEARCH | Endpoint returned JSON content in web retrieval; exact current payload should be confirmed by on-device probe | Parsing is deliberately defensive because the provider schema may change. |
-| NOAA SWPC | Space weather, geomagnetic storms, solar radiation and radio blackouts | services.swpc.noaa.gov/products/alerts.json | Official page confirms JSON feed; retrieval tool received HTTP 403 | A phone-side 403 should be treated as access denial, not no alerts. |
-| NOAA NHC | Atlantic/eastern Pacific tropical cyclone products | nhc.noaa.gov/index-at.xml | Retrieval tool received HTTP 403 | NHC feed uses RSS/XML. |
-| Tsunami Warning Centers | Tsunami watches, advisories and warnings | tsunami.gov/events/xml/PAAQAtom.xml and PHEBAtom.xml | XML content type was unsupported by retrieval layer, so body parsing was not verified | Official Atom/CAP feeds. |
-| JMA | Japan weather warnings/advisories | jma.go.jp/bosai/warning/data/warning/130000.json | Valid JSON warning response returned for test code 130000 | Configure the appropriate local JMA area/prefecture code in each Japanese city. |
-| MeteoAlarm / MeteoGate | Weather warnings across 33 European member countries | feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-{country} | Official feed directory lists country-specific Atom feeds; legacy RSS feeds were sunset on 2026-01-14 | App maps supported country names to country-specific Atom feeds and matches warning locality text. MeteoGate also offers public OGC EDR access. |
-| EMSC | Worldwide seismic information | emsc-csem.org/service/rss/rss.php?typ=emsc | Not validated | Secondary earthquake source; USGS is the primary implemented source. |
-| FEMA IPAWS | US public emergency messages including some WEA-originated messages | Official All-Hazards Information Feed | Not polled | Requires registration/approval and agreement; deliberately marked setup-required. |
+## Current source endpoints
 
-## On-device test protocol
+| Source | Current test/runtime endpoint | Expected format | Coverage / caveat |
+|---|---|---|---|
+| NWS | https://api.weather.gov/alerts/active?point=25.7617,-80.1918 (diagnostic); runtime uses each selected city point | JSON-LD / GeoJSON | USA. Uses official NWS watches, warnings, advisories and statements. |
+| USGS | https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson | GeoJSON | Worldwide earthquake catalogue; city radius filter. |
+| EMSC SeismicPortal | https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit=100&orderby=time | JSON | Worldwide EMSC event catalogue. FDSN service supports time, geographic and magnitude constraints. |
+| NASA EONET | https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=500 | JSON | Worldwide curated natural-event metadata; not a civil-protection warning authority. |
+| GDACS | https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH | JSON | Worldwide disaster events; the schema may change. |
+| NOAA SWPC | https://services.swpc.noaa.gov/products/alerts.json | JSON | Worldwide space-weather bulletins. |
+| NOAA NHC | https://www.nhc.noaa.gov/index-at.xml | RSS/XML | Atlantic and eastern Pacific tropical cyclone products. |
+| US Tsunami Warning Centers | https://www.tsunami.gov/events/xml/PAAQAtom.xml and PHEBAtom.xml | Atom/XML/CAP-linked | Official bulletins for their warning regions. |
+| JMA | https://www.jma.go.jp/bosai/warning/data/warning/{areaCode}.json | JSON | Japan. The area code is manually configured per city; 130000 is Tokyo. |
+| MeteoAlarm | https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-{country-slug} | Atom | Country-specific feeds. The diagnostic source uses Germany as a representative test; runtime maps the manually selected city country to its feed. |
+| Nominatim | https://nominatim.openstreetmap.org/search | JSON | City-name geocoding only; not an alert service. Respect the public usage policy and rate limit. |
+| FEMA IPAWS | FEMA All-Hazards Information Feed | CAP | Requires access approval/agreement. Deliberately disabled until credentials/authorization are available. |
 
-Run Sources → Test all on the target phone. For each endpoint record:
-- DNS and TLS success (implicitly measured by request completion),
-- HTTP status,
-- response Content-Type,
-- body length,
-- elapsed time,
-- exception text for failures.
+## Diagnostic classifications
 
-Interpretation:
-- ONLINE: HTTP 2xx and an endpoint answered.
-- REDIRECT: HTTP 3xx; verify redirect destination.
-- REACHABLE / ACCESS DENIED: 401/403; host answered but denied this request.
-- HTTP ERROR: other HTTP error.
-- UNREACHABLE: DNS/TLS/timeout/routing or client error.
+- ONLINE · VALID PAYLOAD: HTTP 2xx and the response has the expected JSON/XML structure.
+- ONLINE · NO DATA: HTTP 204. Request succeeded; no records matched.
+- WRONG FORMAT / HTML PAGE: HTTP 2xx, but response is an HTML website/directory rather than a machine feed.
+- WRONG FORMAT / UNEXPECTED PAYLOAD: HTTP 2xx, but JSON/XML shape is not what the adapter expects.
+- REACHABLE / ACCESS DENIED: HTTP 401/403.
+- NOT FOUND: HTTP 404.
+- RATE LIMITED: HTTP 429.
+- PROVIDER ERROR: HTTP 5xx.
+- TIMEOUT: call exceeded the bounded request time.
+- DNS ERROR: hostname resolution failed.
+- TLS ERROR: TLS handshake/certificate issue.
+- UNREACHABLE: other network/client exception.
 
-Do not classify an HTTP 200 as proof that alert records parse, cover the selected city, or represent every hazard type. Verify a parsed record and its sent/effective/expires metadata.
+HTTP 200 alone is not success. The result must have the expected format before the app says the source is a valid feed.
 
-## Notification tests
+## Runtime behavior
 
-Settings contains local notification test channels for every built-in category. These only test Android notification permissions, channel sound/vibration and lock-screen display. They do not create or request a real emergency alert.
+- Four source probes are performed concurrently.
+- Diagnostic requests use 5-second connect, 7-second read and 9-second call timeouts. This prevents one blocked source from holding the entire diagnostic screen for a long time.
+- NWS requests use manually supplied city coordinates, not device location. NWS point-alert requests are documented by the service; county-based and zone-based UGC semantics matter for broad regional monitoring.
+- MeteoAlarm uses country-specific Atom feeds selected by the configured city country. The feed directory itself is not treated as an alerts feed.
+- EONET uses its JSON Events API; event geometry records are checked against manually supplied coordinates/radius.
+- EMSC uses the documented FDSN event service with JSON output, not the older EMSC RSS URL.
+- A timeout or access error is distinct from an empty feed. The UI must not imply that the area is safe when a source cannot be reached.
+- Android WorkManager may delay background jobs. The app does not receive US WEA cell broadcast messages for remote locations.
 
-## Data formats and limitations
+## References
 
-- JSON / JSON-LD / GeoJSON: parsed with org.json.
-- RSS / Atom / CAP: basic XML entry parsing; providers with deeply nested or provider-specific schemas may need a dedicated adapter.
-- NWS: alert event, headline, description, severity, effective/expiry and source URL are retained.
-- USGS: magnitude, location, depth, time and source URL are retained.
-- EONET: event title, description and coordinates are used for radius matching.
-- JMA: regional code and headline text are retained.
-- Generic feeds are associated with a city only when the item text contains its city/region/country. This avoids assigning an unrelated global alert to every city, but may miss messages with abbreviated place names.
-
-## Known implementation gaps
-
-- FEMA IPAWS feed integration is not enabled until the user obtains access.
-- NHC, SWPC, MeteoAlarm, GDACS and EMSC feed schemas require validation against the device-side responses; diagnostics supplies actual status but not complete schema conformance.
-- No official provider offers an all-hazards, globally complete feed. Custom HTTPS RSS/Atom/CAP feeds are supported as an extension point.
-- Android WorkManager's periodic minimum is 15 minutes and execution can be deferred. This is not equivalent to carrier WEA delivery or real-time push.
+- NWS API: https://www.weather.gov/documentation/services-web-api
+- NWS geolocation guide: https://www.weather.gov/media/documentation/docs/NWS_Geolocation.pdf
+- EONET v3 API documentation: https://eonet.gsfc.nasa.gov/docs/v3
+- EMSC FDSN API documentation: https://www.seismicportal.eu/fdsnws/event/1/redoc
+- MeteoAlarm country feed directory: https://feeds.meteoalarm.org/
+- USGS real-time feeds: https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php

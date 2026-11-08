@@ -35,6 +35,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppContextHolder.context = applicationContext
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+        androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
         AlertNotifier.ensureChannels(getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager)
         MonitorScheduler.schedule(applicationContext)
         setContent { EaaApp() }
@@ -79,8 +84,10 @@ private fun EaaApp() {
 
     MaterialTheme(colorScheme = appColors) {
         Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp)) {
+                Column(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars).padding(horizontal = 18.dp, vertical = 12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text("EMERGENCY ALERT", style = MaterialTheme.typography.labelMedium,
@@ -94,7 +101,10 @@ private fun EaaApp() {
                 }
             },
             bottomBar = {
-                NavigationBar {
+                NavigationBar(
+                    modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
+                    windowInsets = WindowInsets(0, 0, 0, 0)
+                ) {
                     listOf("Alerts", "Cities", "Sources", "Settings").forEach { key ->
                         NavigationBarItem(selected = tab == key, onClick = { tab = key },
                             icon = { Text(when (key) { "Alerts" -> "◉"; "Cities" -> "⌖"; "Sources" -> "⇄"; else -> "⚙" }) },
@@ -103,7 +113,7 @@ private fun EaaApp() {
                 }
             }
         ) { padding ->
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 when (tab) {
                     "Alerts" -> AlertsScreen(alerts, cities, isWorking,
                         onRefresh = {
@@ -253,7 +263,7 @@ private fun SourcesScreen(probes: Map<String, ProbeResult>, feeds: List<CustomFe
                             val detail = "HTTP " + (p.httpCode?.toString() ?: "—") + " · " + p.elapsedMs + " ms · " +
                                 DateFormat.getTimeInstance().format(Date(p.checkedAt)) + "\n" + p.detail
                             Text(detail, style = MaterialTheme.typography.labelSmall,
-                                color = if (p.status == "ONLINE") MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.error)
+                                color = if (p.status.startsWith("ONLINE")) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.error)
                         }
                     }
                 }

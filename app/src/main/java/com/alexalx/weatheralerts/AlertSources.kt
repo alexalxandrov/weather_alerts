@@ -16,17 +16,17 @@ import kotlin.math.*
 object SourceCatalog {
     val all = listOf(
         SourceSpec("nominatim", "OpenStreetMap Nominatim geocoder", "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=New%20York", "JSON", "Worldwide", "Manual city-name lookup only; no device location. Observe the public service usage policy."),
-        SourceSpec("nws", "US National Weather Service", "https://api.weather.gov/alerts/active?status=actual", "JSON-LD / GeoJSON", "United States", "Watches, warnings, advisories and statements. Point queries are made per manually configured city."),
+        SourceSpec("nws", "US National Weather Service", "https://api.weather.gov/alerts/active?point=25.7617,-80.1918", "JSON-LD / GeoJSON", "United States", "Probe uses Miami coordinates; live monitoring queries each manually configured city point."),
         SourceSpec("usgs", "USGS Earthquakes", "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson", "GeoJSON", "Worldwide", "Earthquakes; events are distance-filtered against configured cities."),
-        SourceSpec("eonet", "NASA EONET", "https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=open&limit=500", "GeoJSON", "Worldwide", "Curated natural events: wildfires, storms, volcanoes, sea/lake ice and more."),
+        SourceSpec("eonet", "NASA EONET", "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=500", "JSON", "Worldwide", "Curated natural events: wildfires, storms, volcanoes, sea/lake ice and more."),
         SourceSpec("gdacs", "GDACS", "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH", "JSON", "Worldwide", "Global disaster alerts; event payload formats can change."),
         SourceSpec("swpc", "NOAA Space Weather Prediction Center", "https://services.swpc.noaa.gov/products/alerts.json", "JSON", "Worldwide", "Solar flares, geomagnetic storms, radiation storms and radio blackouts."),
         SourceSpec("nhc", "NOAA National Hurricane Center", "https://www.nhc.noaa.gov/index-at.xml", "RSS / XML", "Atlantic and eastern Pacific", "Tropical cyclone products and advisories."),
         SourceSpec("tsunami_paaq", "US Tsunami Warning Center — Alaska", "https://www.tsunami.gov/events/xml/PAAQAtom.xml", "Atom / CAP", "US / Alaska / Canada region", "Official tsunami bulletins."),
         SourceSpec("tsunami_pheb", "US Tsunami Warning Center — Pacific", "https://www.tsunami.gov/events/xml/PHEBAtom.xml", "Atom / CAP", "Pacific and connected warning regions", "Official tsunami bulletins."),
         SourceSpec("jma_tokyo", "Japan Meteorological Agency — Tokyo", "https://www.jma.go.jp/bosai/warning/data/warning/130000.json", "JSON", "Japan (Tokyo test area)", "JMA warning/advisory JSON. Configure JMA area/prefecture code on a city."),
-        SourceSpec("meteoalarm", "MeteoAlarm / MeteoGate", "https://feeds.meteoalarm.org/", "Atom", "Supported European countries", "Country-specific Atom feeds; legacy RSS was sunset in January 2026. The app selects feeds from each manually configured city country."),
-        SourceSpec("emsc", "EMSC Seismic Portal", "https://www.emsc-csem.org/service/rss/rss.php?typ=emsc", "RSS / XML", "Worldwide", "Earthquake information feed; secondary to USGS."),
+        SourceSpec("meteoalarm", "MeteoAlarm country feed (Germany probe)", "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-germany", "Atom", "Supported European countries", "Country-specific Atom feeds. The selected country feed is polled for each configured city; legacy RSS feeds were sunset in January 2026."),
+        SourceSpec("emsc", "EMSC SeismicPortal FDSN", "https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit=100&orderby=time", "JSON", "Worldwide", "Official FDSN event catalogue. Supports time, region, magnitude and depth filters."),
         SourceSpec("fema_ipaws", "FEMA IPAWS All-Hazards", "https://www.fema.gov/emergency-managers/practitioners/integrated-public-alert-warning-system/technology-developers/all-hazards-information-feed", "CAP", "United States", "Requires approved access / agreement; no credential-free polling is attempted.", true)
     )
 }
@@ -38,12 +38,23 @@ object AlertNetwork {
         .connectTimeout(12, TimeUnit.SECONDS).readTimeout(18, TimeUnit.SECONDS)
         .callTimeout(25, TimeUnit.SECONDS).followRedirects(true).build()
 
-    fun get(url: String, accept: String = "*/*"): HttpResult {
+    fun get(
+        url: String,
+        accept: String = "*/*",
+        connectTimeoutSeconds: Long = 8,
+        readTimeoutSeconds: Long = 10,
+        callTimeoutSeconds: Long = 12
+    ): HttpResult {
         val request = Request.Builder().url(url)
-            .header("User-Agent", "EmergencyAlertAggregator/0.1 (Android personal alert monitor)")
+            .header("User-Agent", "EmergencyAlertAggregator/0.2 (Android personal alert monitor; contact: project repository)")
             .header("Accept", accept).header("Cache-Control", "no-cache").get().build()
         val started = System.nanoTime()
-        client.newCall(request).execute().use { response ->
+        val requestClient = client.newBuilder()
+            .connectTimeout(connectTimeoutSeconds, TimeUnit.SECONDS)
+            .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
+            .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
+            .build()
+        requestClient.newCall(request).execute().use { response ->
             val body = response.body?.string().orEmpty()
             return HttpResult(response.code, body.take(2_000_000), response.header("Content-Type").orEmpty(),
                 (System.nanoTime() - started) / 1_000_000)
@@ -82,27 +93,79 @@ object CityGeocoder {
 }
 
 object SourceDiagnostics {
+    private fun classifyPayload(spec: SourceSpec, http: HttpResult): String {
+        if (http.code == 204) return "ONLINE · NO DATA"
+        if (http.code !in 200..299) return when (http.code) {
+            401, 403 -> "REACHABLE / ACCESS DENIED"
+            404 -> "NOT FOUND"
+            429 -> "RATE LIMITED"
+            in 500..599 -> "PROVIDER ERROR"
+            else -> "HTTP ERROR"
+        }
+        val body = http.body.trimStart()
+        val mime = http.contentType.lowercase()
+        val valid = when (spec.id) {
+            "nominatim" -> body.startsWith("[") && runCatching { JSONArray(body) }.isSuccess
+            "nws", "usgs", "eonet", "gdacs", "swpc", "jma" -> {
+                val parsed = runCatching { JSONTokener(body).nextValue() }.getOrNull()
+                when (spec.id) {
+                    "usgs" -> parsed is JSONObject && parsed.optJSONArray("features") != null
+                    "eonet" -> parsed is JSONObject && (parsed.optJSONArray("events") != null || parsed.optJSONArray("features") != null)
+                    "swpc" -> parsed is JSONArray || parsed is JSONObject
+                    "gdacs" -> parsed is JSONObject || parsed is JSONArray
+                    else -> parsed is JSONObject
+                }
+            }
+            "nhc", "tsunami_paaq", "tsunami_pheb", "meteoalarm" ->
+                (body.startsWith("<") || mime.contains("xml") || mime.contains("atom") || mime.contains("rss")) &&
+                    !mime.contains("html") && !body.substring(0, minOf(500, body.length)).lowercase().contains("<html")
+            "emsc" -> {
+                val parsed = runCatching { JSONTokener(body).nextValue() }.getOrNull()
+                parsed is JSONObject || parsed is JSONArray
+            }
+            else -> body.isNotBlank()
+        }
+        if (!valid) {
+            val looksHtml = mime.contains("html") || body.take(300).lowercase().contains("<html")
+            return if (looksHtml) "WRONG FORMAT / HTML PAGE" else "WRONG FORMAT / UNEXPECTED PAYLOAD"
+        }
+        return "ONLINE · VALID PAYLOAD"
+    }
+
+    private fun testOne(context: Context, spec: SourceSpec): ProbeResult {
+        val start = System.nanoTime()
+        return try {
+            val http = AlertNetwork.get(spec.endpoint, when (spec.format.lowercase()) {
+                "json", "geojson", "json-ld / geojson" -> "application/json, application/geo+json, application/ld+json"
+                "atom" -> "application/atom+xml, application/xml, text/xml"
+                "rss / xml", "atom / cap" -> "application/atom+xml, application/rss+xml, application/xml, text/xml"
+                else -> "*/*"
+            }, connectTimeoutSeconds = 5, readTimeoutSeconds = 7, callTimeoutSeconds = 9)
+            ProbeResult(spec.id, classifyPayload(spec, http), http.code, http.elapsedMs,
+                detail = http.contentType.ifBlank { "unknown content type" } + " · " + http.body.length + " chars")
+        } catch (e: Exception) {
+            val message = (e.message ?: e.javaClass.simpleName).take(180)
+            val status = when {
+                e is java.net.SocketTimeoutException || message.contains("timeout", true) -> "TIMEOUT"
+                e is java.net.UnknownHostException -> "DNS ERROR"
+                e is javax.net.ssl.SSLException -> "TLS ERROR"
+                else -> "UNREACHABLE"
+            }
+            ProbeResult(spec.id, status, null, (System.nanoTime() - start) / 1_000_000, detail = message)
+        }
+    }
+
     fun runAll(context: Context): List<ProbeResult> {
         val db = LocalDatabase(context)
-        return SourceCatalog.all.filterNot { it.requiresSetup }.map { spec ->
-            val start = System.nanoTime()
-            val result = try {
-                val http = AlertNetwork.get(spec.endpoint)
-                val status = when {
-                    http.code in 200..299 -> "ONLINE"
-                    http.code in 300..399 -> "REDIRECT"
-                    http.code == 401 || http.code == 403 -> "REACHABLE / ACCESS DENIED"
-                    else -> "HTTP ERROR"
-                }
-                ProbeResult(spec.id, status, http.code, http.elapsedMs,
-                    detail = "${http.contentType.ifBlank { "unknown content type" }} · ${http.body.length} chars")
-            } catch (e: Exception) {
-                ProbeResult(spec.id, "UNREACHABLE", null,
-                    (System.nanoTime() - start) / 1_000_000,
-                    detail = (e.message ?: e.javaClass.simpleName).take(180))
+        val specs = SourceCatalog.all.filterNot { it.requiresSetup }
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(4)
+        return try {
+            val tasks = specs.map { spec -> java.util.concurrent.Callable { testOne(context, spec) } }
+            executor.invokeAll(tasks).mapNotNull { future ->
+                runCatching { future.get() }.getOrNull()?.also { db.saveProbe(it) }
             }
-            db.saveProbe(result)
-            result
+        } finally {
+            executor.shutdownNow()
         }
     }
 }
@@ -130,8 +193,8 @@ object AlertEngine {
         } catch (_: Exception) { }
 
         try {
-            val body = AlertNetwork.get("https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=open&limit=500",
-                "application/geo+json, application/json").body
+            val body = AlertNetwork.get("https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=500",
+                "application/json").body
             created += parseEonet(body, cities, db)
         } catch (_: Exception) { }
 
@@ -149,7 +212,7 @@ object AlertEngine {
             "nhc" to "https://www.nhc.noaa.gov/index-at.xml",
             "tsunami_paaq" to "https://www.tsunami.gov/events/xml/PAAQAtom.xml",
             "tsunami_pheb" to "https://www.tsunami.gov/events/xml/PHEBAtom.xml",
-            "emsc" to "https://www.emsc-csem.org/service/rss/rss.php?typ=emsc"
+            "emsc" to "https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit=100&orderby=time"
         )
         globalFeeds.forEach { (source, url) ->
             try {
@@ -253,23 +316,49 @@ object AlertEngine {
     }
 
     private fun parseEonet(text: String, cities: List<City>, db: LocalDatabase): Int {
-        val features = JSONObject(text).optJSONArray("features") ?: return 0
+        val root = JSONObject(text)
+        val events = root.optJSONArray("events") ?: root.optJSONArray("features") ?: return 0
         var count = 0
-        for (i in 0 until features.length()) {
-            val f = features.optJSONObject(i) ?: continue
-            val p = f.optJSONObject("properties") ?: JSONObject()
+        for (i in 0 until events.length()) {
+            val event = events.optJSONObject(i) ?: continue
+            val p = event.optJSONObject("properties") ?: event
             val title = p.optString("title", "Natural event")
-            val category = classify(title + " " + p.optString("description"))
-            val coords = mutableListOf<Pair<Double, Double>>()
-            collectCoordinates(f.optJSONObject("geometry"), coords)
+            val description = p.optString("description")
+            val category = classify(title + " " + description)
+            val coordinates = mutableListOf<Pair<Double, Double>>()
+
+            // EONET Events API uses a list of geometry records; GeoJSON output uses a geometry object.
+            val geometryList = event.optJSONArray("geometry")
+            if (geometryList != null) {
+                for (g in 0 until geometryList.length()) {
+                    val geometryRecord = geometryList.optJSONObject(g) ?: continue
+                    collectCoordinatesFromValue(geometryRecord.opt("coordinates"), coordinates)
+                    collectCoordinates(geometryRecord.optJSONObject("geometry"), coordinates)
+                }
+            }
+            collectCoordinates(event.optJSONObject("geometry"), coordinates)
+
             cities.forEach { city ->
-                val near = if (city.latitude != null && city.longitude != null)
-                    coords.any { distanceKm(it.second, it.first, city.latitude!!, city.longitude!!) <= max(300, city.radiusKm * 2) }
-                else title.contains(city.name, true)
+                val near = if (city.latitude != null && city.longitude != null) {
+                    coordinates.any {
+                        distanceKm(it.second, it.first, city.latitude!!, city.longitude!!) <= max(300, city.radiusKm * 2)
+                    }
+                } else {
+                    (title + " " + description).contains(city.name, true)
+                }
                 if (near) {
-                    val r = AlertRecord(stableId("eonet", f.optString("id", title)), "eonet", city.name,
-                        title, title, p.optString("description"), "Unknown", category, url = p.optString("link"))
-                    if (db.putAlert(r)) { count++; AlertNotifier.show(AppContextHolder.context ?: return count, r) }
+                    val eventId = event.optString("id", p.optString("id", title))
+                    val url = p.optString("link").ifBlank { event.optString("link") }
+                    val record = AlertRecord(
+                        stableId("eonet", city.name + "|" + eventId), "eonet", city.name,
+                        title, title, description, "Unknown", category,
+                        effective = p.optString("date").ifBlank { p.optString("closed") },
+                        url = url
+                    )
+                    if (db.putAlert(record)) {
+                        count++
+                        AlertNotifier.show(AppContextHolder.context ?: return count, record)
+                    }
                 }
             }
         }
@@ -348,7 +437,13 @@ object AlertEngine {
                     XmlPullParser.START_TAG -> {
                         val tag = parser.name.lowercase()
                         if (tag in listOf("item", "entry", "alert")) { active = true; fields.clear() }
-                        else if (active) field = tag
+                        else if (active) {
+                            field = tag
+                            if (tag == "link") {
+                                val href = parser.getAttributeValue(null, "href")
+                                if (!href.isNullOrBlank()) fields["link"] = href
+                            }
+                        }
                     }
                     XmlPullParser.TEXT -> if (active && field.isNotBlank())
                         fields[field] = (fields[field].orEmpty() + " " + parser.text).trim()
@@ -376,6 +471,24 @@ object AlertEngine {
             }
         } catch (_: Exception) { }
         return out
+    }
+
+    private fun collectCoordinatesFromValue(value: Any?, out: MutableList<Pair<Double, Double>>) {
+        when (value) {
+            is JSONArray -> {
+                if (value.length() >= 2 && value.opt(0) is Number && value.opt(1) is Number) {
+                    out.add(value.optDouble(0) to value.optDouble(1))
+                } else {
+                    for (i in 0 until value.length()) collectCoordinatesFromValue(value.opt(i), out)
+                }
+            }
+            is JSONObject -> {
+                if (value.has("coordinates")) collectCoordinatesFromValue(value.opt("coordinates"), out)
+                else if (value.has("longitude") && value.has("latitude")) {
+                    out.add(value.optDouble("longitude") to value.optDouble("latitude"))
+                }
+            }
+        }
     }
 
     private fun collectCoordinates(geometry: JSONObject?, out: MutableList<Pair<Double, Double>>) {

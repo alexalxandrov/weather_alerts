@@ -6,8 +6,8 @@ Android-only, local-first emergency alert monitor. The app has no developer-oper
 
 - Manual city list with optional latitude/longitude, radius and regional code (e.g. JMA area code).
 - Direct Android HTTP polling of public alert/data endpoints.
-- Source diagnostics performed from the phone: HTTP status, response type, elapsed time, DNS/TLS/timeout errors.
-- NWS point alerts, USGS global earthquake feed, NASA EONET natural events, JMA warnings, and generic JSON/RSS/Atom/CAP/XML feed adapters.
+- Source diagnostics performed from the phone: concurrent HTTP probes, HTTP status, payload validation, MIME type, elapsed time, DNS/TLS/timeout errors. HTML pages no longer count as successful alert feeds.
+- NWS point alerts, USGS global earthquake feed, EMSC FDSN JSON service, NASA EONET Events API, JMA warnings, and generic JSON/RSS/Atom/CAP/XML feed adapters.
 - Additional configured feeds can be added by HTTPS URL.
 - Local SQLite history and event de-duplication.
 - Category-based Android notification channels and local test notifications.
@@ -39,3 +39,14 @@ APK output: app/build/outputs/apk/debug/app-debug.apk.
 5. Run Check now to poll sources.
 
 Source diagnostics on the target phone are authoritative for availability from that phone's network. A successful DNS/TCP connection does not guarantee that a feed contains alerts for a city.
+
+
+## 0.2 feedback fixes
+
+- Added explicit Android edge-to-edge insets for the status bar, navigation bar and Scaffold content. The app header should no longer render underneath the notification shade/status bar.
+- Source diagnostics now run four endpoints concurrently with bounded 9-second call timeout.
+- The diagnostic result checks payload shape and MIME type. HTTP 200 with HTML is displayed as a wrong-format response rather than ONLINE.
+- The EONET adapter now uses the documented JSON Events API and reads its geometry records.
+- EMSC now uses the official SeismicPortal FDSN JSON endpoint rather than the retired/invalid RSS URL.
+- The MeteoAlarm diagnostic probes an actual country Atom feed; runtime monitoring chooses the country feed matching each manually entered city.
+- NWS diagnostic probes a Miami point instead of downloading the nationwide active-alert index.

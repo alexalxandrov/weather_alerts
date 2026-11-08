@@ -286,7 +286,7 @@ object AlertEngine {
         }
 
         db.activeAlerts()
-        newActive
+        return newActive
     }
 
     private fun meteoAlarmCountryFeeds(cities: List<City>): List<Triple<String, String, String>> {

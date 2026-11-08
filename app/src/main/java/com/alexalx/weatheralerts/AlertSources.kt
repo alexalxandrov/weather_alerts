@@ -25,7 +25,7 @@ object SourceCatalog {
         SourceSpec("tsunami_paaq", "US Tsunami Warning Center — Alaska", "https://www.tsunami.gov/events/xml/PAAQAtom.xml", "Atom / CAP", "US / Alaska / Canada region", "Official tsunami bulletins."),
         SourceSpec("tsunami_pheb", "US Tsunami Warning Center — Pacific", "https://www.tsunami.gov/events/xml/PHEBAtom.xml", "Atom / CAP", "Pacific and connected warning regions", "Official tsunami bulletins."),
         SourceSpec("jma_tokyo", "Japan Meteorological Agency — Tokyo", "https://www.jma.go.jp/bosai/warning/data/warning/130000.json", "JSON", "Japan (Tokyo test area)", "JMA warning/advisory JSON. Configure JMA area/prefecture code on a city."),
-        SourceSpec("meteoalarm", "MeteoAlarm / MeteoGate", "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-europe", "API / Atom / OGC EDR", "33 European countries", "Public access is advertised; real-time MQTT and queryable warnings may require API setup depending on interface."),
+        SourceSpec("meteoalarm", "MeteoAlarm / MeteoGate", "https://feeds.meteoalarm.org/", "Atom", "Supported European countries", "Country-specific Atom feeds; legacy RSS was sunset in January 2026. The app selects feeds from each manually configured city country."),
         SourceSpec("emsc", "EMSC Seismic Portal", "https://www.emsc-csem.org/service/rss/rss.php?typ=emsc", "RSS / XML", "Worldwide", "Earthquake information feed; secondary to USGS."),
         SourceSpec("fema_ipaws", "FEMA IPAWS All-Hazards", "https://www.fema.gov/emergency-managers/practitioners/integrated-public-alert-warning-system/technology-developers/all-hazards-information-feed", "CAP", "United States", "Requires approved access / agreement; no credential-free polling is attempted.", true)
     )
@@ -149,7 +149,6 @@ object AlertEngine {
             "nhc" to "https://www.nhc.noaa.gov/index-at.xml",
             "tsunami_paaq" to "https://www.tsunami.gov/events/xml/PAAQAtom.xml",
             "tsunami_pheb" to "https://www.tsunami.gov/events/xml/PHEBAtom.xml",
-            "meteoalarm" to "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-europe",
             "emsc" to "https://www.emsc-csem.org/service/rss/rss.php?typ=emsc"
         )
         globalFeeds.forEach { (source, url) ->
@@ -159,6 +158,17 @@ object AlertEngine {
                     val records = if (response.body.trimStart().startsWith("<")) parseXml(source, response.body, cities)
                                  else parseGenericJson(source, response.body, cities)
                     records.forEach { if (db.putAlert(it)) { created++; AlertNotifier.show(context, it) } }
+                }
+            } catch (_: Exception) { }
+        }
+        // MeteoAlarm exposes actively maintained Atom feeds per country, not one universal Europe Atom feed.
+        meteoAlarmCountryFeeds(cities).forEach { (country, slug, url) ->
+            try {
+                val response = AlertNetwork.get(url, "application/atom+xml, application/xml, */*")
+                if (response.code in 200..299 && response.body.isNotBlank()) {
+                    val countryCities = cities.filter { it.country.equals(country, true) }
+                    parseXml("meteoalarm_" + slug, response.body, countryCities)
+                        .forEach { if (db.putAlert(it)) { created++; AlertNotifier.show(context, it) } }
                 }
             } catch (_: Exception) { }
         }
@@ -175,6 +185,32 @@ object AlertEngine {
         return created
     }
 
+    private fun meteoAlarmCountryFeeds(cities: List<City>): List<Triple<String, String, String>> {
+        val aliases = mapOf(
+            "andorra" to "andorra", "austria" to "austria", "belgium" to "belgium",
+            "bosnia and herzegovina" to "bosnia-herzegovina", "bosnia & herzegovina" to "bosnia-herzegovina",
+            "bulgaria" to "bulgaria", "croatia" to "croatia", "cyprus" to "cyprus",
+            "czech republic" to "czechia", "czechia" to "czechia", "denmark" to "denmark",
+            "estonia" to "estonia", "finland" to "finland", "france" to "france",
+            "germany" to "germany", "greece" to "greece", "hungary" to "hungary",
+            "iceland" to "iceland", "ireland" to "ireland", "israel" to "israel",
+            "italy" to "italy", "latvia" to "latvia", "lithuania" to "lithuania",
+            "luxembourg" to "luxembourg", "malta" to "malta", "moldova" to "moldova",
+            "republic of moldova" to "moldova", "montenegro" to "montenegro",
+            "netherlands" to "netherlands", "the netherlands" to "netherlands",
+            "north macedonia" to "republic-of-north-macedonia", "norway" to "norway",
+            "poland" to "poland", "portugal" to "portugal", "romania" to "romania",
+            "serbia" to "serbia", "slovakia" to "slovakia", "slovenia" to "slovenia",
+            "spain" to "spain", "sweden" to "sweden", "switzerland" to "switzerland",
+            "ukraine" to "ukraine", "united kingdom" to "united-kingdom",
+            "great britain" to "united-kingdom",
+            "united kingdom of great britain and northern ireland" to "united-kingdom"
+        )
+        return cities.mapNotNull { city ->
+            val slug = aliases[city.country.trim().lowercase()] ?: return@mapNotNull null
+            Triple(city.country, slug, "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-" + slug)
+        }.distinctBy { it.second }
+    }
     private fun parseNws(text: String, city: City, db: LocalDatabase): Int {
         val features = JSONObject(text).optJSONArray("features") ?: return 0
         var count = 0

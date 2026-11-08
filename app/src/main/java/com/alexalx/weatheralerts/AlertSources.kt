@@ -25,7 +25,7 @@ object SourceCatalog {
         SourceSpec("tsunami_paaq", "US Tsunami Warning Center — Alaska", "https://www.tsunami.gov/events/xml/PAAQAtom.xml", "Atom / CAP", "US / Alaska / Canada region", "Official tsunami bulletins."),
         SourceSpec("tsunami_pheb", "US Tsunami Warning Center — Pacific", "https://www.tsunami.gov/events/xml/PHEBAtom.xml", "Atom / CAP", "Pacific and connected warning regions", "Official tsunami bulletins."),
         SourceSpec("jma_tokyo", "Japan Meteorological Agency — Tokyo", "https://www.jma.go.jp/bosai/warning/data/warning/130000.json", "JSON", "Japan (Tokyo test area)", "JMA warning/advisory JSON. Configure JMA area/prefecture code on a city."),
-        SourceSpec("meteoalarm", "MeteoAlarm / MeteoGate", "https://api.meteoalarm.org/", "API / Atom / OGC EDR", "33 European countries", "Public access is advertised; real-time MQTT and queryable warnings may require API setup depending on interface."),
+        SourceSpec("meteoalarm", "MeteoAlarm / MeteoGate", "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-europe", "API / Atom / OGC EDR", "33 European countries", "Public access is advertised; real-time MQTT and queryable warnings may require API setup depending on interface."),
         SourceSpec("emsc", "EMSC Seismic Portal", "https://www.emsc-csem.org/service/rss/rss.php?typ=emsc", "RSS / XML", "Worldwide", "Earthquake information feed; secondary to USGS."),
         SourceSpec("fema_ipaws", "FEMA IPAWS All-Hazards", "https://www.fema.gov/emergency-managers/practitioners/integrated-public-alert-warning-system/technology-developers/all-hazards-information-feed", "CAP", "United States", "Requires approved access / agreement; no credential-free polling is attempted.", true)
     )
@@ -149,7 +149,7 @@ object AlertEngine {
             "nhc" to "https://www.nhc.noaa.gov/index-at.xml",
             "tsunami_paaq" to "https://www.tsunami.gov/events/xml/PAAQAtom.xml",
             "tsunami_pheb" to "https://www.tsunami.gov/events/xml/PHEBAtom.xml",
-            "meteoalarm" to "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-generic",
+            "meteoalarm" to "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-europe",
             "emsc" to "https://www.emsc-csem.org/service/rss/rss.php?typ=emsc"
         )
         globalFeeds.forEach { (source, url) ->

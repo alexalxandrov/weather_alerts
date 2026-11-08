@@ -20,10 +20,6 @@ class LocalDatabase(context: Context) : SQLiteOpenHelper(context, "emergency_ale
             db.execSQL("ALTER TABLE alerts ADD COLUMN issued_at TEXT NOT NULL DEFAULT ''")
             db.execSQL("ALTER TABLE alerts ADD COLUMN status TEXT NOT NULL DEFAULT 'Actual'")
             createCacheTables(db)
-            // Preserve the previous app's journal as seen history so clearing it after upgrade
-            // does not make the same still-active records reappear as new.
-            db.execSQL("INSERT OR IGNORE INTO alert_seen(id, first_seen_at) SELECT id, received_at FROM alerts")
-            db.execSQL("INSERT OR IGNORE INTO alert_cache(id, source_id, city, event, headline, description, severity, category, effective, expires, url, received_at, issued_at, status, event_time, cached_at, cache_bytes) SELECT id, source_id, city, event, headline, description, severity, category, effective, expires, url, received_at, issued_at, status, received_at, received_at, 256 + length(id) + length(source_id) + length(city) + length(event) + length(headline) + length(description) + length(effective) + length(expires) + length(url) FROM alerts")
         }
     }
 
@@ -80,7 +76,7 @@ class LocalDatabase(context: Context) : SQLiteOpenHelper(context, "emergency_ale
 
     fun activeAlerts(now: Long = System.currentTimeMillis(), limit: Int = 250): List<AlertRecord> {
         pruneCacheNow(now)
-        val all = alerts(limit * 2)
+        val all = alerts(Int.MAX_VALUE)
         val active = all.filter { AlertFreshness.isActiveWithin24Hours(it, now) }
         val inactiveIds = all.filterNot { AlertFreshness.isActiveWithin24Hours(it, now) }.map { it.id }
         if (inactiveIds.isNotEmpty()) {

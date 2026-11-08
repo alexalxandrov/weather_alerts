@@ -631,7 +631,7 @@ object AlertEngine {
                     .ifBlank { p.optString("todate") }.ifBlank { p.optString("toDate") }
                 val status = p.optString("messageType").ifBlank { p.optString("status", "Actual") }
                 out += AlertRecord(
-                    id = stableId(source, rawId),
+                    id = stableId(source, city.name + "|" + rawId),
                     sourceId = source,
                     city = city.name,
                     event = p.optString("event").ifBlank { title },
@@ -702,9 +702,9 @@ object AlertEngine {
                                         (city.region.isNotBlank() && textForMatch.contains(city.region, true)) ||
                                         (city.country.isNotBlank() && textForMatch.contains(city.country, true))
                                 }.forEach { city ->
-                                    val rawId = fields["id"].orEmpty().ifBlank { link.ifBlank { title + issued } }
+                                    val rawId = fields["id"].orEmpty().ifBlank { link.ifBlank { title } }
                                     out += AlertRecord(
-                                        id = stableId(source, city.name + "|" + rawId),
+                                        id = stableId(source, rawId),
                                         sourceId = source,
                                         city = city.name,
                                         event = fields["event"].orEmpty().ifBlank { title },

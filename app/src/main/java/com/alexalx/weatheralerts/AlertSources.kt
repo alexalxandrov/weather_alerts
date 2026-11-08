@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import org.xmlpull.v1.XmlPullParser
 import java.io.StringReader
 import java.security.MessageDigest
@@ -14,6 +15,7 @@ import kotlin.math.*
 
 object SourceCatalog {
     val all = listOf(
+        SourceSpec("nominatim", "OpenStreetMap Nominatim geocoder", "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=New%20York", "JSON", "Worldwide", "Manual city-name lookup only; no device location. Observe the public service usage policy."),
         SourceSpec("nws", "US National Weather Service", "https://api.weather.gov/alerts/active?status=actual", "JSON-LD / GeoJSON", "United States", "Watches, warnings, advisories and statements. Point queries are made per manually configured city."),
         SourceSpec("usgs", "USGS Earthquakes", "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson", "GeoJSON", "Worldwide", "Earthquakes; events are distance-filtered against configured cities."),
         SourceSpec("eonet", "NASA EONET", "https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=open&limit=500", "GeoJSON", "Worldwide", "Curated natural events: wildfires, storms, volcanoes, sea/lake ice and more."),
@@ -45,6 +47,36 @@ object AlertNetwork {
             val body = response.body?.string().orEmpty()
             return HttpResult(response.code, body.take(2_000_000), response.header("Content-Type").orEmpty(),
                 (System.nanoTime() - started) / 1_000_000)
+        }
+    }
+}
+
+
+data class CityMatch(val displayName: String, val latitude: Double, val longitude: Double)
+
+object CityGeocoder {
+    @Volatile private var lastRequestAt = 0L
+
+    fun search(query: String): List<CityMatch> {
+        val clean = query.trim()
+        if (clean.isBlank()) return emptyList()
+        synchronized(this) {
+            val wait = 1000L - (System.currentTimeMillis() - lastRequestAt)
+            if (wait > 0) Thread.sleep(wait)
+            lastRequestAt = System.currentTimeMillis()
+        }
+        val encoded = java.net.URLEncoder.encode(clean, Charsets.UTF_8.name())
+        val result = AlertNetwork.get(
+            "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=" + encoded,
+            "application/json"
+        )
+        if (result.code !in 200..299) return emptyList()
+        val array = JSONArray(result.body)
+        return (0 until array.length()).mapNotNull { i ->
+            val item = array.optJSONObject(i) ?: return@mapNotNull null
+            val lat = item.optString("lat").toDoubleOrNull() ?: return@mapNotNull null
+            val lon = item.optString("lon").toDoubleOrNull() ?: return@mapNotNull null
+            CityMatch(item.optString("display_name"), lat, lon)
         }
     }
 }
@@ -221,23 +253,47 @@ object AlertEngine {
 
     private fun parseGenericJson(source: String, text: String, cities: List<City>): List<AlertRecord> {
         val out = mutableListOf<AlertRecord>()
-        val root = try { JSONObject(text) } catch (_: Exception) { return out }
-        val array = root.optJSONArray("features") ?: root.optJSONArray("events") ?: root.optJSONArray("items") ?: return out
+        val array = try {
+            when (val value = JSONTokener(text).nextValue()) {
+                is JSONArray -> value
+                is JSONObject -> value.optJSONArray("features") ?: value.optJSONArray("events") ?:
+                    value.optJSONArray("eventlist") ?: value.optJSONArray("items") ?: value.optJSONArray("data")
+                else -> null
+            }
+        } catch (_: Exception) { null } ?: return out
         for (i in 0 until array.length()) {
             val item = array.optJSONObject(i) ?: continue
             val p = item.optJSONObject("properties") ?: item
-            val title = p.optString("title").ifBlank { p.optString("headline") }.ifBlank { p.optString("event") }
+            val title = p.optString("title")
+                .ifBlank { p.optString("headline") }
+                .ifBlank { p.optString("event") }
+                .ifBlank { p.optString("product_id") }
+                .ifBlank { p.optString("type") }
+                .ifBlank { p.optString("message") }
             if (title.isBlank()) continue
-            val description = p.optString("description").ifBlank { p.optString("summary") }
+            val description = p.optString("description")
+                .ifBlank { p.optString("summary") }
+                .ifBlank { p.optString("message") }
             val place = p.optString("areaDesc").ifBlank { p.optString("country") }
-            val matched = cities.filter { city -> (title + " " + description + " " + place).contains(city.name, true) ||
-                (city.region.isNotBlank() && (title + description + place).contains(city.region, true)) ||
-                (city.country.isNotBlank() && (title + description + place).contains(city.country, true)) }
+            val textForMatch = title + " " + description + " " + place
+            val coordinates = mutableListOf<Pair<Double, Double>>()
+            collectCoordinates(item.optJSONObject("geometry"), coordinates)
+            val matched = cities.filter { city ->
+                val textMatch = textForMatch.contains(city.name, true) ||
+                    (city.region.isNotBlank() && textForMatch.contains(city.region, true)) ||
+                    (city.country.isNotBlank() && textForMatch.contains(city.country, true))
+                val geoMatch = city.latitude != null && city.longitude != null &&
+                    coordinates.any { distanceKm(it.second, it.first, city.latitude!!, city.longitude!!) <= city.radiusKm }
+                source == "swpc" || textMatch || geoMatch
+            }
             matched.forEach { city ->
-                out += AlertRecord(stableId(source, item.optString("id", title + description)), source, city.name,
+                val rawId = item.optString("id").ifBlank { p.optString("product_id") }.ifBlank { title + description }
+                val url = p.optString("url").ifBlank { p.optString("link") }
+                val effective = p.optString("effective").ifBlank { p.optString("sent") }.ifBlank { p.optString("issue_datetime") }
+                out += AlertRecord(stableId(source, city.name + "|" + rawId), source, city.name,
                     p.optString("event").ifBlank { title }, title, description,
                     p.optString("severity", "Unknown"), classify(title + " " + description),
-                    p.optString("effective"), p.optString("expires"), p.optString("url").ifBlank { p.optString("link") })
+                    effective, p.optString("expires"), url)
             }
         }
         return out

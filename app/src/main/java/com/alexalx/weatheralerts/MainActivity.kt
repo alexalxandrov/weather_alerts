@@ -329,6 +329,10 @@ private fun CityDialog(onDismiss: () -> Unit, onSave: (City) -> Unit) {
     var code by remember { mutableStateOf("") }
     var radius by remember { mutableStateOf("300") }
     var error by remember { mutableStateOf("") }
+    var searching by remember { mutableStateOf(false) }
+    var searchMessage by remember { mutableStateOf("") }
+    var matches by remember { mutableStateOf<List<CityMatch>>(emptyList()) }
+    val searchScope = rememberCoroutineScope()
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add monitored location") },
@@ -341,6 +345,29 @@ private fun CityDialog(onDismiss: () -> Unit, onSave: (City) -> Unit) {
                 OutlinedTextField(name, { name=it }, label={Text("City / place name *")}, singleLine=true)
                 OutlinedTextField(country, { country=it }, label={Text("Country *")}, singleLine=true)
                 OutlinedTextField(region, { region=it }, label={Text("State / province / region")}, singleLine=true)
+                Button(onClick = {
+                    searchScope.launch {
+                        searching = true
+                        searchMessage = "Searching place names…"
+                        val query = listOf(name, region, country).filter { it.isNotBlank() }.joinToString(", ")
+                        val found = withContext(Dispatchers.IO) { CityGeocoder.search(query) }
+                        matches = found
+                        searchMessage = if (found.isEmpty()) "No results or geocoder unavailable. You can enter coordinates manually."
+                            else "Choose a result to fill coordinates."
+                        searching = false
+                    }
+                }, enabled = !searching && name.isNotBlank() && country.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+                    Text(if (searching) "Searching…" else "Find city coordinates (internet)")
+                }
+                if (searchMessage.isNotBlank()) Text(searchMessage, style = MaterialTheme.typography.bodySmall)
+                matches.forEach { match ->
+                    TextButton(onClick = {
+                        lat = match.latitude.toString()
+                        lon = match.longitude.toString()
+                        searchMessage = match.displayName
+                        matches = emptyList()
+                    }) { Text(match.displayName, maxLines = 2) }
+                }
                 OutlinedTextField(lat, { lat=it }, label={Text("Latitude")}, singleLine=true, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
                 OutlinedTextField(lon, { lon=it }, label={Text("Longitude")}, singleLine=true, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Decimal))
                 OutlinedTextField(radius, { radius=it }, label={Text("Nearby event radius, km")}, singleLine=true, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number))

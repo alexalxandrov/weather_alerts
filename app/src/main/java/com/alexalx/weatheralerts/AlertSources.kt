@@ -171,81 +171,122 @@ object SourceDiagnostics {
 }
 
 object AlertEngine {
-    fun sync(context: Context): Int {
-        AppContextHolder.context = context.applicationContext
+    private val syncLock = Any()
+
+    fun sync(context: Context): Int = synchronized(syncLock) {
+        syncInternal(context.applicationContext)
+    }
+
+    private fun syncInternal(context: Context): Int {
+        AppContextHolder.context = context
         val db = LocalDatabase(context)
         val cities = db.cities()
-        var created = 0
-        if (cities.isEmpty()) return 0
-
-        cities.filter { it.latitude != null && it.longitude != null }.forEach { city ->
-            try {
-                val url = "https://api.weather.gov/alerts/active?point=${city.latitude},${city.longitude}"
-                val body = AlertNetwork.get(url, "application/geo+json, application/ld+json, application/json").body
-                created += parseNws(body, city, db)
-            } catch (_: Exception) { }
+        if (cities.isEmpty()) {
+            db.activeAlerts()
+            return 0
         }
 
-        try {
-            val body = AlertNetwork.get("https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson",
-                "application/geo+json, application/json").body
-            created += parseUsgs(body, cities, db)
-        } catch (_: Exception) { }
+        var newActive = 0
+        fun acceptAll(records: Iterable<AlertRecord>) {
+            records.forEach { record ->
+                if (db.ingestAlert(record)) {
+                    newActive++
+                    AlertNotifier.show(context, record)
+                }
+            }
+        }
 
-        try {
-            val body = AlertNetwork.get("https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=500",
-                "application/json").body
-            created += parseEonet(body, cities, db)
-        } catch (_: Exception) { }
+        cities.filter { it.latitude != null && it.longitude != null }.forEach { city ->
+            runCatching {
+                val url = "https://api.weather.gov/alerts/active?point=" + city.latitude + "," + city.longitude
+                val body = AlertNetwork.get(url, "application/geo+json, application/ld+json, application/json").body
+                acceptAll(parseNws(body, city))
+            }
+        }
+
+        runCatching {
+            val body = AlertNetwork.get(
+                "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson",
+                "application/geo+json, application/json"
+            ).body
+            acceptAll(parseUsgs(body, cities))
+        }
+
+        runCatching {
+            val body = AlertNetwork.get(
+                "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=500",
+                "application/json"
+            ).body
+            acceptAll(parseEonet(body, cities))
+        }
 
         cities.filter { it.regionCode.isNotBlank() }.forEach { city ->
-            try {
+            runCatching {
                 val code = city.regionCode.trim()
-                val body = AlertNetwork.get("https://www.jma.go.jp/bosai/warning/data/warning/$code.json", "application/json").body
-                created += parseJma(body, city, db)
-            } catch (_: Exception) { }
+                val body = AlertNetwork.get(
+                    "https://www.jma.go.jp/bosai/warning/data/warning/" + code + ".json",
+                    "application/json"
+                ).body
+                acceptAll(parseJma(body, city))
+            }
         }
 
         val globalFeeds = listOf(
             "gdacs" to "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH",
-            "swpc" to "https://services.swpc.noaa.gov/products/alerts.json",
             "nhc" to "https://www.nhc.noaa.gov/index-at.xml",
             "tsunami_paaq" to "https://www.tsunami.gov/events/xml/PAAQAtom.xml",
             "tsunami_pheb" to "https://www.tsunami.gov/events/xml/PHEBAtom.xml",
             "emsc" to "https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit=100&orderby=time"
         )
         globalFeeds.forEach { (source, url) ->
-            try {
+            runCatching {
                 val response = AlertNetwork.get(url)
                 if (response.code in 200..299 && response.body.isNotBlank()) {
-                    val records = if (response.body.trimStart().startsWith("<")) parseXml(source, response.body, cities)
-                                 else parseGenericJson(source, response.body, cities)
-                    records.forEach { if (db.putAlert(it)) { created++; AlertNotifier.show(context, it) } }
+                    val records = if (response.body.trimStart().startsWith("<")) {
+                        parseXml(source, response.body, cities)
+                    } else {
+                        parseGenericJson(source, response.body, cities)
+                    }
+                    acceptAll(records)
                 }
-            } catch (_: Exception) { }
+            }
         }
-        // MeteoAlarm exposes actively maintained Atom feeds per country, not one universal Europe Atom feed.
+
+        runCatching {
+            val swpc = AlertNetwork.get(
+                "https://services.swpc.noaa.gov/products/alerts.json",
+                "application/json"
+            ).body
+            acceptAll(parseSwpc(swpc, cities))
+        }
+
         meteoAlarmCountryFeeds(cities).forEach { (country, slug, url) ->
-            try {
+            runCatching {
                 val response = AlertNetwork.get(url, "application/atom+xml, application/xml, */*")
                 if (response.code in 200..299 && response.body.isNotBlank()) {
                     val countryCities = cities.filter { it.country.equals(country, true) }
-                    parseXml("meteoalarm_" + slug, response.body, countryCities)
-                        .forEach { if (db.putAlert(it)) { created++; AlertNotifier.show(context, it) } }
+                    acceptAll(parseXml("meteoalarm_" + slug, response.body, countryCities))
                 }
-            } catch (_: Exception) { }
+            }
         }
 
         db.customFeeds().forEach { feed ->
-            try {
+            runCatching {
                 val response = AlertNetwork.get(feed.url)
                 if (response.code in 200..299 && response.body.isNotBlank()) {
-                    parseXml("custom_${feed.id}", response.body, cities, feed.name)
-                        .forEach { if (db.putAlert(it)) { created++; AlertNotifier.show(context, it) } }
+                    val records = if (response.body.trimStart().startsWith("{") ||
+                        response.body.trimStart().startsWith("[")) {
+                        parseGenericJson("custom_" + feed.id, response.body, cities)
+                    } else {
+                        parseXml("custom_" + feed.id, response.body, cities, feed.name)
+                    }
+                    acceptAll(records)
                 }
-            } catch (_: Exception) { }
+            }
         }
-        return created
+
+        db.activeAlerts()
+        newActive
     }
 
     private fun meteoAlarmCountryFeeds(cities: List<City>): List<Triple<String, String, String>> {
@@ -274,106 +315,265 @@ object AlertEngine {
             Triple(city.country, slug, "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-" + slug)
         }.distinctBy { it.second }
     }
-    private fun parseNws(text: String, city: City, db: LocalDatabase): Int {
-        val features = JSONObject(text).optJSONArray("features") ?: return 0
-        var count = 0
+
+    private fun parseNws(text: String, city: City): List<AlertRecord> {
+        val out = mutableListOf<AlertRecord>()
+        val features = runCatching { JSONObject(text).optJSONArray("features") }.getOrNull() ?: return out
         for (i in 0 until features.length()) {
-            val f = features.optJSONObject(i) ?: continue
-            val p = f.optJSONObject("properties") ?: continue
+            val feature = features.optJSONObject(i) ?: continue
+            val p = feature.optJSONObject("properties") ?: continue
             val event = p.optString("event", "Weather alert")
             val headline = p.optString("headline").ifBlank { event }
-            val r = AlertRecord(stableId("nws", f.optString("id", headline + p.optString("sent"))),
-                "nws", city.name, event, headline, p.optString("description").ifBlank { p.optString("instruction") },
-                p.optString("severity", "Unknown"), classify(event + " " + headline),
-                p.optString("effective"), p.optString("expires"), p.optString("web").ifBlank { f.optString("id") })
-            if (db.putAlert(r)) { count++; AlertNotifier.show(AppContextHolder.context ?: return count, r) }
+            val messageType = p.optString("messageType", "Alert")
+            out += AlertRecord(
+                id = stableId("nws", city.name + "|" + feature.optString("id", headline + p.optString("sent"))),
+                sourceId = "nws",
+                city = city.name,
+                event = event,
+                headline = headline,
+                description = p.optString("description").ifBlank { p.optString("instruction") },
+                severity = p.optString("severity", "Unknown"),
+                category = classify(event + " " + headline),
+                effective = p.optString("effective").ifBlank { p.optString("onset") },
+                expires = p.optString("expires").ifBlank { p.optString("ends") },
+                url = p.optString("web").ifBlank { feature.optString("id") },
+                issuedAt = p.optString("sent"),
+                status = if (messageType.equals("Cancel", true)) "Cancel" else p.optString("status", "Actual")
+            )
         }
-        return count
+        return out
     }
 
-    private fun parseUsgs(text: String, cities: List<City>, db: LocalDatabase): Int {
-        val features = JSONObject(text).optJSONArray("features") ?: return 0
-        var count = 0
+    private fun parseUsgs(text: String, cities: List<City>): List<AlertRecord> {
+        val out = mutableListOf<AlertRecord>()
+        val features = runCatching { JSONObject(text).optJSONArray("features") }.getOrNull() ?: return out
         for (i in 0 until features.length()) {
-            val f = features.optJSONObject(i) ?: continue
-            val p = f.optJSONObject("properties") ?: continue
-            val coords = f.optJSONObject("geometry")?.optJSONArray("coordinates") ?: continue
-            if (coords.length() < 2) continue
-            val lon = coords.optDouble(0); val lat = coords.optDouble(1)
-            cities.filter { it.latitude != null && it.longitude != null &&
-                distanceKm(lat, lon, it.latitude!!, it.longitude!!) <= it.radiusKm }.forEach { city ->
+            val feature = features.optJSONObject(i) ?: continue
+            val p = feature.optJSONObject("properties") ?: continue
+            val coordinates = feature.optJSONObject("geometry")?.optJSONArray("coordinates") ?: continue
+            if (coordinates.length() < 2) continue
+            val lon = coordinates.optDouble(0)
+            val lat = coordinates.optDouble(1)
+            cities.filter { city ->
+                city.latitude != null && city.longitude != null &&
+                    distanceKm(lat, lon, city.latitude!!, city.longitude!!) <= city.radiusKm
+            }.forEach { city ->
                 val title = p.optString("title", "Earthquake")
                 val magnitude = p.optDouble("mag", 0.0)
-                val r = AlertRecord(stableId("usgs", f.optString("id", title)), "usgs", city.name,
-                    "Earthquake M $magnitude", title,
-                    "Magnitude: $magnitude · ${p.optString("place")} · Depth: ${coords.optDouble(2)} km",
-                    if (magnitude >= 6.0) "Severe" else "Moderate", "Earthquake",
-                    effective = p.optLong("time").toString(), url = p.optString("url"))
-                if (db.putAlert(r)) { count++; AlertNotifier.show(AppContextHolder.context ?: return count, r) }
+                val eventTime = p.optLong("time").toString()
+                out += AlertRecord(
+                    id = stableId("usgs", city.name + "|" + feature.optString("id", title)),
+                    sourceId = "usgs",
+                    city = city.name,
+                    event = "Earthquake M " + magnitude,
+                    headline = title,
+                    description = "Magnitude: " + magnitude + " · " + p.optString("place") + " · Depth: " + coordinates.optDouble(2) + " km",
+                    severity = if (magnitude >= 6.0) "Severe" else if (magnitude >= 4.5) "Moderate" else "Minor",
+                    category = "Earthquake",
+                    effective = eventTime,
+                    url = p.optString("url"),
+                    issuedAt = eventTime
+                )
             }
         }
-        return count
+        return out
     }
 
-    private fun parseEonet(text: String, cities: List<City>, db: LocalDatabase): Int {
-        val root = JSONObject(text)
-        val events = root.optJSONArray("events") ?: root.optJSONArray("features") ?: return 0
-        var count = 0
+    private fun parseEonet(text: String, cities: List<City>): List<AlertRecord> {
+        val out = mutableListOf<AlertRecord>()
+        val root = runCatching { JSONObject(text) }.getOrNull() ?: return out
+        val events = root.optJSONArray("events") ?: root.optJSONArray("features") ?: return out
         for (i in 0 until events.length()) {
             val event = events.optJSONObject(i) ?: continue
             val p = event.optJSONObject("properties") ?: event
             val title = p.optString("title", "Natural event")
             val description = p.optString("description")
-            val category = classify(title + " " + description)
+            val geometryRecords = event.optJSONArray("geometry")
             val coordinates = mutableListOf<Pair<Double, Double>>()
-
-            // EONET Events API uses a list of geometry records; GeoJSON output uses a geometry object.
-            val geometryList = event.optJSONArray("geometry")
-            if (geometryList != null) {
-                for (g in 0 until geometryList.length()) {
-                    val geometryRecord = geometryList.optJSONObject(g) ?: continue
+            var mostRecentGeometry = ""
+            if (geometryRecords != null) {
+                for (g in 0 until geometryRecords.length()) {
+                    val geometryRecord = geometryRecords.optJSONObject(g) ?: continue
+                    val date = geometryRecord.optString("date")
+                    if (date.isNotBlank() && (mostRecentGeometry.isBlank() ||
+                        (AlertFreshness.parseTime(date) ?: 0L) > (AlertFreshness.parseTime(mostRecentGeometry) ?: 0L))) {
+                        mostRecentGeometry = date
+                    }
                     collectCoordinatesFromValue(geometryRecord.opt("coordinates"), coordinates)
                     collectCoordinates(geometryRecord.optJSONObject("geometry"), coordinates)
                 }
             }
             collectCoordinates(event.optJSONObject("geometry"), coordinates)
+            val issued = mostRecentGeometry.ifBlank { p.optString("date") }
+            val closed = event.optString("closed").ifBlank { p.optString("closed") }
 
             cities.forEach { city ->
                 val near = if (city.latitude != null && city.longitude != null) {
-                    coordinates.any {
-                        distanceKm(it.second, it.first, city.latitude!!, city.longitude!!) <= max(300, city.radiusKm * 2)
-                    }
+                    coordinates.any { distanceKm(it.second, it.first, city.latitude!!, city.longitude!!) <= max(300, city.radiusKm * 2) }
                 } else {
                     (title + " " + description).contains(city.name, true)
                 }
                 if (near) {
-                    val eventId = event.optString("id", p.optString("id", title))
-                    val url = p.optString("link").ifBlank { event.optString("link") }
-                    val record = AlertRecord(
-                        stableId("eonet", city.name + "|" + eventId), "eonet", city.name,
-                        title, title, description, "Unknown", category,
-                        effective = p.optString("date").ifBlank { p.optString("closed") },
-                        url = url
+                    out += AlertRecord(
+                        id = stableId("eonet", city.name + "|" + event.optString("id", p.optString("id", title))),
+                        sourceId = "eonet",
+                        city = city.name,
+                        event = title,
+                        headline = title,
+                        description = description,
+                        category = classify(title + " " + description),
+                        effective = issued,
+                        expires = closed,
+                        url = p.optString("link").ifBlank { event.optString("link") },
+                        issuedAt = issued,
+                        status = if (closed.isNotBlank()) "Expired" else "Actual"
                     )
-                    if (db.putAlert(record)) {
-                        count++
-                        AlertNotifier.show(AppContextHolder.context ?: return count, record)
-                    }
                 }
             }
         }
-        return count
+        return out
     }
 
-    private fun parseJma(text: String, city: City, db: LocalDatabase): Int {
-        val o = JSONObject(text)
+    private fun parseJma(text: String, city: City): List<AlertRecord> {
+        val o = runCatching { JSONObject(text) }.getOrNull() ?: return emptyList()
         val headline = o.optString("headlineText")
-        if (headline.isBlank() || headline.contains("発表警報・注意報はなし")) return 0
-        val content = headline + " " + o.optString("reportDatetime")
-        val r = AlertRecord(stableId("jma", city.regionCode + content), "jma_tokyo", city.name,
-            "JMA warning/advisory", headline, content, "Unknown", classify(content),
-            effective = o.optString("reportDatetime"), url = "https://www.jma.go.jp/bosai/warning/")
-        return if (db.putAlert(r)) { AlertNotifier.show(AppContextHolder.context ?: return 0, r); 1 } else 0
+        if (headline.isBlank() || headline.contains("発表警報・注意報はなし")) return emptyList()
+        val reportTime = o.optString("reportDatetime")
+        val details = o.toString().take(5000)
+        return listOf(
+            AlertRecord(
+                id = stableId("jma", city.regionCode + "|" + reportTime + "|" + headline),
+                sourceId = "jma",
+                city = city.name,
+                event = "JMA warning/advisory",
+                headline = headline,
+                description = headline + "\n" + details,
+                severity = "Unknown",
+                category = classify(headline + " " + details),
+                effective = reportTime,
+                issuedAt = reportTime,
+                url = "https://www.jma.go.jp/bosai/warning/"
+            )
+        )
+    }
+
+    private fun parseSwpc(text: String, cities: List<City>): List<AlertRecord> {
+        val out = mutableListOf<AlertRecord>()
+        val root = runCatching { JSONTokener(text).nextValue() }.getOrNull()
+        val messages = when (root) {
+            is JSONArray -> root
+            is JSONObject -> root.optJSONArray("messages") ?: root.optJSONArray("alerts") ?: JSONArray()
+            else -> JSONArray()
+        }
+        for (i in 0 until messages.length()) {
+            val item = messages.optJSONObject(i) ?: continue
+            val code = item.optString("product_id").ifBlank { item.optString("code") }
+            val rawMessage = item.optString("message").ifBlank { item.optString("text") }
+            val issued = item.optString("issue_datetime").ifBlank { item.optString("issue_time") }
+            if (code.isBlank() || rawMessage.isBlank() || issued.isBlank()) continue
+            if (code.startsWith("SUM", true)) continue
+            if (!code.startsWith("ALT", true) && !code.startsWith("WAR", true) && !code.startsWith("WAT", true)) continue
+            if (rawMessage.contains("Active Warning: NO", true) ||
+                rawMessage.contains("THIS MESSAGE HAS BEEN CANCELLED", true) ||
+                rawMessage.contains("THIS MESSAGE HAS BEEN CANCELED", true)) continue
+
+            val serial = Regex("(?im)^Serial Number:\\s*(\\d+)").find(rawMessage)?.groupValues?.getOrNull(1).orEmpty()
+            val readable = spaceWeatherTitle(code, rawMessage)
+            val cleaned = rawMessage.lineSequence()
+                .filterNot { line ->
+                    val l = line.trim().lowercase()
+                    l.startsWith("space weather message code:") ||
+                        l.startsWith("serial number:") ||
+                        l.startsWith("issue time:")
+                }
+                .joinToString("\n").trim()
+            val expiry = extractSwpcExpiry(rawMessage, issued)
+            cities.forEach { city ->
+                out += AlertRecord(
+                    id = stableId("swpc", city.name + "|" + code + "|" + serial + "|" + issued),
+                    sourceId = "swpc",
+                    city = city.name,
+                    event = code,
+                    headline = readable,
+                    description = "NOAA SWPC · " + code + " · issued " + issued + "\n\n" + cleaned,
+                    severity = swpcSeverity(code),
+                    category = "Space Weather",
+                    effective = issued,
+                    expires = expiry,
+                    url = "https://www.swpc.noaa.gov/products/alerts-watches-and-warnings",
+                    issuedAt = issued,
+                    status = "Actual"
+                )
+            }
+        }
+        return out
+    }
+
+    internal fun spaceWeatherTitle(code: String, message: String = ""): String {
+        val upper = code.uppercase()
+        val line = Regex("(?im)^\\s*(?:CONTINUED\\s+)?(ALERT|WARNING|WATCH):\\s*(.+)$")
+            .find(message)?.let { it.groupValues[1] + ": " + it.groupValues[2].trim() }
+        Regex("^(?:ALT|WAR)K(\\d{2})$").find(upper)?.let { match ->
+            val level = match.groupValues[1].trimStart('0').ifBlank { "0" }
+            return if (upper.startsWith("WAR")) "Geomagnetic disturbance expected · K-index " + level
+                else "Geomagnetic disturbance observed · K-index " + level
+        }
+        Regex("^WATA(\\d{2})$").find(upper)?.let { match ->
+            val scale = when (match.groupValues[1]) {
+                "20" -> "G1 (minor)"
+                "30" -> "G2 (moderate)"
+                "50" -> "G3 (strong)"
+                "99" -> "G4 or greater (severe to extreme)"
+                else -> "geomagnetic storm"
+            }
+            return "Geomagnetic storm watch · " + scale + " predicted"
+        }
+        if (upper == "ALTEF3") return "High-energy electron flux alert · satellite charging risk"
+        if (upper == "ALTTP2") return "Type II solar radio emission detected · possible CME/shock"
+        if (upper.startsWith("ALTP") || upper.startsWith("WARP")) return "Solar proton event · radiation storm " + if (upper.startsWith("WARP")) "warning" else "alert"
+        if (upper.startsWith("ALTS") || upper.startsWith("WARS")) return "Solar X-ray / flare activity · " + if (upper.startsWith("WARS")) "warning" else "alert"
+        if (!line.isNullOrBlank()) return line
+        val kind = when {
+            upper.startsWith("WAT") -> "watch"
+            upper.startsWith("WAR") -> "warning"
+            else -> "alert"
+        }
+        return "Space-weather " + kind + " · " + code
+    }
+
+    internal fun swpcSeverity(code: String): String {
+        val upper = code.uppercase()
+        Regex("(?:ALT|WAR)K(\\d{2})").find(upper)?.let {
+            val kp = it.groupValues[1].toIntOrNull() ?: 0
+            return when { kp >= 8 -> "Severe"; kp >= 6 -> "High"; kp >= 5 -> "Moderate"; else -> "Minor" }
+        }
+        return when (upper) {
+            "WATA20" -> "Minor"
+            "WATA30" -> "Moderate"
+            "WATA50" -> "Strong"
+            "WATA99" -> "Severe"
+            "ALTEF3", "ALTTP2" -> "Moderate"
+            else -> "Unknown"
+        }
+    }
+
+    private fun extractSwpcExpiry(message: String, issued: String): String {
+        Regex("(?im)^\\s*(?:Valid Until|End Time|Warning End Time|Expiration Time):\\s*(.+)$")
+            .find(message)?.groupValues?.getOrNull(1)?.trim()?.let { value ->
+                if (AlertFreshness.parseTime(value) != null) return value
+            }
+        val period = Regex("(?im)^\\s*Synoptic Period:\\s*(\\d{4})-(\\d{4})").find(message)
+        if (period != null) {
+            val issueTime = AlertFreshness.parseTime(issued)
+            if (issueTime != null) {
+                val end = period.groupValues[2].toIntOrNull() ?: return ""
+                val issueCalendar = java.time.Instant.ofEpochMilli(issueTime).atZone(java.time.ZoneOffset.UTC)
+                var endDate = issueCalendar.toLocalDate().atTime(end / 100, end % 100)
+                if (endDate.isBefore(issueCalendar.toLocalDateTime().minusHours(3))) endDate = endDate.plusDays(1)
+                return endDate.atZone(java.time.ZoneOffset.UTC).toInstant().toString()
+            }
+        }
+        return ""
     }
 
     private fun parseGenericJson(source: String, text: String, cities: List<City>): List<AlertRecord> {
@@ -386,6 +586,7 @@ object AlertEngine {
                 else -> null
             }
         } catch (_: Exception) { null } ?: return out
+
         for (i in 0 until array.length()) {
             val item = array.optJSONObject(i) ?: continue
             val p = item.optJSONObject("properties") ?: item
@@ -409,16 +610,41 @@ object AlertEngine {
                     (city.country.isNotBlank() && textForMatch.contains(city.country, true))
                 val geoMatch = city.latitude != null && city.longitude != null &&
                     coordinates.any { distanceKm(it.second, it.first, city.latitude!!, city.longitude!!) <= city.radiusKm }
-                source == "swpc" || textMatch || geoMatch
+                textMatch || geoMatch
             }
+
             matched.forEach { city ->
-                val rawId = item.optString("id").ifBlank { p.optString("product_id") }.ifBlank { title + description }
-                val url = p.optString("url").ifBlank { p.optString("link") }
-                val effective = p.optString("effective").ifBlank { p.optString("sent") }.ifBlank { p.optString("issue_datetime") }
-                out += AlertRecord(stableId(source, city.name + "|" + rawId), source, city.name,
-                    p.optString("event").ifBlank { title }, title, description,
-                    p.optString("severity", "Unknown"), classify(title + " " + description),
-                    effective, p.optString("expires"), url)
+                val rawId = item.optString("id")
+                    .ifBlank { p.optString("id") }
+                    .ifBlank { p.optString("product_id") }
+                    .ifBlank { title + description }
+                val issued = p.optString("sent")
+                    .ifBlank { p.optString("issued") }
+                    .ifBlank { p.optString("issue_datetime") }
+                    .ifBlank { p.optString("updated") }
+                    .ifBlank { p.optString("pubDate") }
+                    .ifBlank { p.optString("time") }
+                    .ifBlank { p.optString("fromdate") }
+                    .ifBlank { p.optString("fromDate") }
+                val effective = p.optString("effective").ifBlank { p.optString("onset") }.ifBlank { issued }
+                val expires = p.optString("expires").ifBlank { p.optString("ends") }
+                    .ifBlank { p.optString("todate") }.ifBlank { p.optString("toDate") }
+                val status = p.optString("messageType").ifBlank { p.optString("status", "Actual") }
+                out += AlertRecord(
+                    id = stableId(source, city.name + "|" + rawId),
+                    sourceId = source,
+                    city = city.name,
+                    event = p.optString("event").ifBlank { title },
+                    headline = title,
+                    description = description,
+                    severity = p.optString("severity", "Unknown"),
+                    category = classify(title + " " + description),
+                    effective = effective,
+                    expires = expires,
+                    url = p.optString("url").ifBlank { p.optString("link") },
+                    issuedAt = issued,
+                    status = status
+                )
             }
         }
         return out
@@ -436,8 +662,10 @@ object AlertEngine {
                 when (parser.eventType) {
                     XmlPullParser.START_TAG -> {
                         val tag = parser.name.lowercase()
-                        if (tag in listOf("item", "entry", "alert")) { active = true; fields.clear() }
-                        else if (active) {
+                        if (tag in listOf("item", "entry", "alert")) {
+                            active = true
+                            fields.clear()
+                        } else if (active) {
                             field = tag
                             if (tag == "link") {
                                 val href = parser.getAttributeValue(null, "href")
@@ -445,26 +673,59 @@ object AlertEngine {
                             }
                         }
                     }
-                    XmlPullParser.TEXT -> if (active && field.isNotBlank())
+                    XmlPullParser.TEXT -> if (active && field.isNotBlank()) {
                         fields[field] = (fields[field].orEmpty() + " " + parser.text).trim()
+                    }
                     XmlPullParser.END_TAG -> {
                         val tag = parser.name.lowercase()
                         if (active && tag in listOf("item", "entry", "alert")) {
-                            val title = fields["headline"].orEmpty().ifBlank { fields["title"].orEmpty() }.ifBlank { fields["event"].orEmpty() }
+                            val title = fields["headline"].orEmpty()
+                                .ifBlank { fields["title"].orEmpty() }
+                                .ifBlank { fields["event"].orEmpty() }
                             val body = fields["description"].orEmpty().ifBlank { fields["summary"].orEmpty() }
                             val area = fields["areadesc"].orEmpty()
                             val link = fields["link"].orEmpty().ifBlank { fields["id"].orEmpty() }
-                            val text = "$title $body $area"
-                            if (title.isNotBlank()) cities.filter { c -> text.contains(c.name, true) ||
-                                (c.region.isNotBlank() && text.contains(c.region, true)) ||
-                                (c.country.isNotBlank() && text.contains(c.country, true)) }.forEach { city ->
-                                out += AlertRecord(stableId(source, fields["id"].orEmpty().ifBlank { link.ifBlank { title } }),
-                                    source, city.name, fields["event"].orEmpty().ifBlank { title }, title, body,
-                                    fields["severity"].orEmpty().ifBlank { "Unknown" }, classify(text),
-                                    fields["effective"].orEmpty(), fields["expires"].orEmpty(), link)
+                            val textForMatch = title + " " + body + " " + area
+                            val issued = fields["sent"].orEmpty()
+                                .ifBlank { fields["updated"].orEmpty() }
+                                .ifBlank { fields["published"].orEmpty() }
+                                .ifBlank { fields["pubdate"].orEmpty() }
+                                .ifBlank { fields["issued"].orEmpty() }
+                                .ifBlank { fields["effective"].orEmpty() }
+                            val messageType = fields["messagetype"].orEmpty()
+                            val state = if (messageType.equals("cancel", true)) "Cancel"
+                                else fields["status"].orEmpty().ifBlank { "Actual" }
+
+                            if (title.isNotBlank()) {
+                                cities.filter { city ->
+                                    textForMatch.contains(city.name, true) ||
+                                        (city.region.isNotBlank() && textForMatch.contains(city.region, true)) ||
+                                        (city.country.isNotBlank() && textForMatch.contains(city.country, true))
+                                }.forEach { city ->
+                                    val rawId = fields["id"].orEmpty().ifBlank { link.ifBlank { title + issued } }
+                                    out += AlertRecord(
+                                        id = stableId(source, city.name + "|" + rawId),
+                                        sourceId = source,
+                                        city = city.name,
+                                        event = fields["event"].orEmpty().ifBlank { title },
+                                        headline = title,
+                                        description = body,
+                                        severity = fields["severity"].orEmpty().ifBlank { "Unknown" },
+                                        category = classify(textForMatch),
+                                        effective = fields["effective"].orEmpty().ifBlank { fields["onset"].orEmpty().ifBlank { issued } },
+                                        expires = fields["expires"].orEmpty().ifBlank { fields["ends"].orEmpty() },
+                                        url = link,
+                                        issuedAt = issued,
+                                        status = state
+                                    )
+                                }
                             }
-                            active = false; fields.clear(); field = ""
-                        } else if (active && field == tag) field = ""
+                            active = false
+                            fields.clear()
+                            field = ""
+                        } else if (active && field == tag) {
+                            field = ""
+                        }
                     }
                 }
                 parser.next()
@@ -493,14 +754,7 @@ object AlertEngine {
 
     private fun collectCoordinates(geometry: JSONObject?, out: MutableList<Pair<Double, Double>>) {
         if (geometry == null) return
-        fun walk(value: Any?) {
-            when (value) {
-                is JSONArray -> if (value.length() >= 2 && value.opt(0) is Number && value.opt(1) is Number)
-                    out += value.optDouble(0) to value.optDouble(1)
-                else if (value is JSONArray) for (i in 0 until value.length()) walk(value.opt(i))
-            }
-        }
-        walk(geometry.opt("coordinates"))
+        collectCoordinatesFromValue(geometry.opt("coordinates"), out)
     }
 
     fun classify(text: String): String {
@@ -521,7 +775,7 @@ object AlertEngine {
             "heat" in s -> "Extreme Heat"
             listOf("cold", "freeze", "frost").any { it in s } -> "Extreme Cold"
             listOf("air quality", "smoke", "particulate").any { it in s } -> "Air Quality"
-            listOf("geomagnetic", "solar flare", "space weather", "radio blackout").any { it in s } -> "Space Weather"
+            listOf("geomagnetic", "solar flare", "space weather", "radio blackout", "electron flux", "type ii radio emission").any { it in s } -> "Space Weather"
             listOf("evacuation", "shelter in place", "civil emergency", "amber alert").any { it in s } -> "Public Safety"
             listOf("wind", "thunderstorm", "storm", "fog", "dust").any { it in s } -> "Weather"
             else -> "Other"
@@ -529,15 +783,16 @@ object AlertEngine {
     }
 
     private fun stableId(source: String, raw: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest("$source|$raw".toByteArray())
+        val bytes = MessageDigest.getInstance("SHA-256").digest((source + "|" + raw).toByteArray())
         return bytes.take(16).joinToString("") { "%02x".format(it) }
     }
 
     private fun distanceKm(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
         val r = 6371.0
-        val dLat = Math.toRadians(lat2-lat1); val dLon = Math.toRadians(lon2-lon1)
-        val a = sin(dLat/2).pow(2.0) + cos(Math.toRadians(lat1))*cos(Math.toRadians(lat2))*sin(dLon/2).pow(2.0)
-        return 2*r*asin(sqrt(a.coerceIn(0.0, 1.0)))
+        val dLat = Math.toRadians(lat2 - lat1)
+        val dLon = Math.toRadians(lon2 - lon1)
+        val a = sin(dLat / 2).pow(2.0) + cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2).pow(2.0)
+        return 2 * r * asin(sqrt(a.coerceIn(0.0, 1.0)))
     }
 }
 

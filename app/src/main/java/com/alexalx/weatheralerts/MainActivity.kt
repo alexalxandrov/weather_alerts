@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 import java.text.DateFormat
 import java.util.Date
 
@@ -64,7 +65,12 @@ private fun EaaApp() {
     var isWorking by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("Ready · manual locations only") }
     val cities = remember { mutableStateListOf<City>().apply { addAll(db.cities()) } }
-    val alerts = remember { mutableStateListOf<AlertRecord>().apply { addAll(db.alerts()) } }
+    val alerts = remember { mutableStateListOf<AlertRecord>().apply { addAll(db.activeAlerts()) } }
+    var cacheBytes by remember { mutableStateOf(db.cacheUsageBytes()) }
+    val monitorPrefs = remember { context.getSharedPreferences(MonitorScheduler.PREFS, android.content.Context.MODE_PRIVATE) }
+    var lastAutoRun by remember { mutableStateOf(monitorPrefs.getLong(MonitorScheduler.KEY_LAST_RUN, 0L)) }
+    var lastAutoNew by remember { mutableStateOf(monitorPrefs.getInt(MonitorScheduler.KEY_LAST_NEW, 0)) }
+    var lastAutoError by remember { mutableStateOf(monitorPrefs.getString(MonitorScheduler.KEY_LAST_ERROR, "").orEmpty()) }
     val probes = remember { mutableStateMapOf<String, ProbeResult>().apply { putAll(db.probes()) } }
     val feeds = remember { mutableStateListOf<CustomFeed>().apply { addAll(db.customFeeds()) } }
 
@@ -77,7 +83,11 @@ private fun EaaApp() {
 
     fun reload() {
         cities.clear(); cities.addAll(db.cities())
-        alerts.clear(); alerts.addAll(db.alerts())
+        alerts.clear(); alerts.addAll(db.activeAlerts())
+        cacheBytes = db.cacheUsageBytes()
+        lastAutoRun = monitorPrefs.getLong(MonitorScheduler.KEY_LAST_RUN, 0L)
+        lastAutoNew = monitorPrefs.getInt(MonitorScheduler.KEY_LAST_NEW, 0)
+        lastAutoError = monitorPrefs.getString(MonitorScheduler.KEY_LAST_ERROR, "").orEmpty()
         probes.clear(); probes.putAll(db.probes())
         feeds.clear(); feeds.addAll(db.customFeeds())
     }
@@ -116,13 +126,14 @@ private fun EaaApp() {
             Box(Modifier.padding(padding).consumeWindowInsets(padding)) {
                 when (tab) {
                     "Alerts" -> AlertsScreen(alerts, cities, isWorking,
+                        onClear = { db.clearJournal(); reload(); statusMessage = "Journal cleared · source cache retained" },
                         onRefresh = {
                             scope.launch {
                                 isWorking = true
                                 statusMessage = "Polling configured sources…"
                                 val count = withContext(Dispatchers.IO) { AlertEngine.sync(context) }
                                 reload()
-                                statusMessage = "Completed · " + count + " new alerts · " + DateFormat.getTimeInstance().format(Date())
+                                statusMessage = "Completed · " + count + " new active alerts · " + DateFormat.getTimeInstance().format(Date())
                                 isWorking = false
                             }
                         },
@@ -144,8 +155,37 @@ private fun EaaApp() {
                         onAddFeed = { showFeedDialog = true },
                         onDeleteFeed = { db.deleteCustomFeed(it); reload() })
                     else -> SettingsScreen(
+                        cacheBytes = cacheBytes,
+                        lastAutoRun = lastAutoRun,
+                        lastAutoNew = lastAutoNew,
+                        lastAutoError = lastAutoError,
                         onTestSound = { AlertNotifier.test(context, it) },
-                        onRefresh = { MonitorScheduler.runNow(context); statusMessage = "Background check queued" })
+                        onRefresh = {
+                            val previousRun = lastAutoRun
+                            MonitorScheduler.runNow(context)
+                            statusMessage = "One-time automatic worker queued"
+                            scope.launch {
+                                var elapsed = 0
+                                while (elapsed < 240) {
+                                    delay(1000)
+                                    val run = withContext(Dispatchers.IO) {
+                                        monitorPrefs.getLong(MonitorScheduler.KEY_LAST_RUN, 0L)
+                                    }
+                                    if (run > previousRun) {
+                                        reload()
+                                        val lastError = monitorPrefs.getString(MonitorScheduler.KEY_LAST_ERROR, "").orEmpty()
+                                        statusMessage = if (lastError.isBlank()) {
+                                            "Background worker completed · " +
+                                                monitorPrefs.getInt(MonitorScheduler.KEY_LAST_NEW, 0) + " new active alerts"
+                                        } else {
+                                            "Background worker error · " + lastError
+                                        }
+                                        break
+                                    }
+                                    elapsed++
+                                }
+                            }
+                        })
                 }
             }
         }
@@ -173,15 +213,36 @@ private fun ScreenHeader(title: String, subtitle: String, trailing: (@Composable
 }
 
 @Composable
-private fun AlertsScreen(alerts: List<AlertRecord>, cities: List<City>, isWorking: Boolean,
-                         onRefresh: () -> Unit, onOpen: (String) -> Unit) {
+private fun AlertsScreen(
+    alerts: List<AlertRecord>,
+    cities: List<City>,
+    isWorking: Boolean,
+    onClear: () -> Unit,
+    onRefresh: () -> Unit,
+    onOpen: (String) -> Unit
+) {
+    var confirmClear by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp).padding(top = 8.dp)) {
-        ScreenHeader("Live alert feed", cities.size.toString() + " manually selected locations") {
-            Button(onClick = onRefresh, enabled = !isWorking) { Text(if (isWorking) "Checking…" else "Check now") }
+        ScreenHeader("Active alert journal", cities.size.toString() + " manually selected locations") {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { confirmClear = true }) { Text("Clear") }
+                Button(onClick = onRefresh, enabled = !isWorking) {
+                    Text(if (isWorking) "Checking…" else "Check now")
+                }
+            }
         }
-        Spacer(Modifier.height(12.dp))
-        if (cities.isEmpty()) EmptyCard("No monitored cities", "Open Cities and add a place manually. Location permission is never requested.")
-        else if (alerts.isEmpty()) EmptyCard("No matching alerts stored", "Run a check. An empty feed does not prove that a source is healthy; inspect Sources for connection status.")
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Only new, active records issued within the last 24 hours. Expired, future and older records are hidden.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
+        )
+        Spacer(Modifier.height(10.dp))
+        if (cities.isEmpty()) {
+            EmptyCard("No monitored cities", "Open Cities and add a place manually. Device location is never requested.")
+        } else if (alerts.isEmpty()) {
+            EmptyCard("No new active alerts", "The journal is empty or has been cleared. Previously seen events remain in the local cache and will not be re-added.")
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 18.dp)) {
             items(alerts, key = { it.id }) { alert ->
                 Card(Modifier.fillMaxWidth().clickable { onOpen(alert.url) }) {
@@ -195,12 +256,29 @@ private fun AlertsScreen(alerts: List<AlertRecord>, cities: List<City>, isWorkin
                         Text(alert.headline, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         Text(alert.city + " · " + alert.sourceId, style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
-                        if (alert.description.isNotBlank()) Text(alert.description, style = MaterialTheme.typography.bodySmall, maxLines = 4)
-                        if (alert.url.isNotBlank()) Text("Open source ↗", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        if (alert.description.isNotBlank()) {
+                            Text(alert.description, style = MaterialTheme.typography.bodySmall, maxLines = 7)
+                        }
+                        if (alert.url.isNotBlank()) {
+                            Text("Open source ↗", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        }
                     }
                 }
             }
         }
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear active alert journal?") },
+            text = { Text("The visible journal will be cleared. The separate 10 MB cache and seen-event IDs will be retained, so existing alerts will not return after the next refresh.") },
+            confirmButton = {
+                TextButton(onClick = { confirmClear = false; onClear() }) { Text("Clear journal") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClear = false }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -288,37 +366,73 @@ private fun SourcesScreen(probes: Map<String, ProbeResult>, feeds: List<CustomFe
 }
 
 @Composable
-private fun SettingsScreen(onTestSound: (String) -> Unit, onRefresh: () -> Unit) {
+private fun SettingsScreen(
+    cacheBytes: Long,
+    lastAutoRun: Long,
+    lastAutoNew: Int,
+    lastAutoError: String,
+    onTestSound: (String) -> Unit,
+    onRefresh: () -> Unit
+) {
     val categories = listOf("Severe Storm", "Tsunami", "Earthquake", "Flood", "Wildfire",
         "Volcano", "Radiological / Nuclear", "Chemical", "Health", "Landslide", "Avalanche",
         "Winter Weather", "Extreme Heat", "Extreme Cold", "Air Quality", "Space Weather", "Public Safety", "Weather", "Other")
     var selected by remember { mutableStateOf(categories.first()) }
+    val cacheMb = cacheBytes.toDouble() / (1024.0 * 1024.0)
+    val lastRunLabel = if (lastAutoRun > 0) DateFormat.getDateTimeInstance().format(Date(lastAutoRun)) else "Not run yet"
+
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Settings & tools", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        EmptyCard("Local-only design", "No account, no developer server, no map and no location permission. The app polls public sources directly from your phone.")
+        EmptyCard("Local-only design", "No account, no developer server, no map and no location permission. Sources are polled directly from this phone.")
+
         Card {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Monitoring frequency", fontWeight = FontWeight.Bold)
-                Text("Background polling uses WorkManager. Android periodic work minimum is 15 minutes and execution can be delayed by Doze, battery optimization or vendor restrictions. Use Check now for an immediate request.",
+                Text("Automatic monitoring", fontWeight = FontWeight.Bold)
+                Text("WorkManager periodic check is scheduled at the Android minimum interval of 15 minutes. Android may defer execution during Doze or battery restrictions.",
                     style = MaterialTheme.typography.bodySmall)
-                Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) { Text("Queue background check") }
+                Text("Last background run: " + lastRunLabel, style = MaterialTheme.typography.bodySmall)
+                Text("New active alerts from last run: " + lastAutoNew, style = MaterialTheme.typography.bodySmall)
+                if (lastAutoError.isNotBlank()) {
+                    Text("Last worker error: " + lastAutoError, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error)
+                }
+                Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) { Text("Test automatic worker now") }
             }
         }
+
+        Card {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Local alert cache", fontWeight = FontWeight.Bold)
+                Text(String.format(java.util.Locale.US, "%.2f MB / 10 MB", cacheMb),
+                    style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                LinearProgressIndicator(
+                    progress = (cacheBytes.toFloat() / (10f * 1024f * 1024f)).coerceIn(0f, 1f),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("Cache retains and refreshes seen alert records for up to 24 hours. Older entries are removed automatically; the cache is capped at 10 MB. Clearing the journal does not clear this cache.",
+                    style = MaterialTheme.typography.bodySmall)
+            }
+        }
+
         Card {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Notification sound test", fontWeight = FontWeight.Bold)
-                Text("A local test only. It does not contact emergency authorities or represent a real alert.", style = MaterialTheme.typography.bodySmall)
+                Text("A local test only. It does not contact emergency authorities or represent a real alert.",
+                    style = MaterialTheme.typography.bodySmall)
                 var expanded by remember { mutableStateOf(false) }
                 Box {
                     OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) { Text(selected) }
                     DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                        categories.forEach { item -> DropdownMenuItem(text = { Text(item) }, onClick = { selected = item; expanded = false }) }
+                        categories.forEach { item ->
+                            DropdownMenuItem(text = { Text(item) }, onClick = { selected = item; expanded = false })
+                        }
                     }
                 }
                 Button(onClick = { onTestSound(selected) }, modifier = Modifier.fillMaxWidth()) { Text("Send test notification") }
             }
         }
+
         Card {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Important limitations", fontWeight = FontWeight.Bold)

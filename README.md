@@ -50,3 +50,20 @@ Source diagnostics on the target phone are authoritative for availability from t
 - EMSC now uses the official SeismicPortal FDSN JSON endpoint rather than the retired/invalid RSS URL.
 - The MeteoAlarm diagnostic probes an actual country Atom feed; runtime monitoring chooses the country feed matching each manually entered city.
 - NWS diagnostic probes a Miami point instead of downloading the nationwide active-alert index.
+
+
+## Active-alert filtering, journal and cache (0.3.0)
+
+- Only records with a parseable issue/event/effective timestamp within the previous 24 hours can enter the active journal or generate a notification.
+- Records with a future effective time, an expiry at or before now, explicit cancellation/expired/test state, or a NOAA SWPC "Active Warning: NO" state are not shown/notified.
+- An unknown event timestamp is not treated as current just because it was downloaded now.
+- The main-screen journal contains only newly-seen active event IDs. A subsequent refresh updates the cache and an existing journal row but does not create a new entry or repeat its notification.
+- Clear Journal deletes only visible journal rows. The separate cache and seen-ID set remain, preventing the same active alert from reappearing after a clear.
+- The local cache retains current/recent source records for up to 24 hours and is capped at 10 MB (estimated serialized record bytes). Old entries are pruned after every sync and journal refresh.
+- Existing version 0.2 journal rows are migrated to the seen-ID set during the database upgrade to avoid duplicate notifications/repopulation after upgrading.
+- The automatic worker uses the same ingestion, age/expiry filter, cache and de-duplication path as manual refresh. WorkManager schedules periodic monitoring at Android's 15-minute minimum; Android may defer actual execution.
+- NOAA SWPC codes now get human-readable titles (for example geomagnetic K-index alerts, G-scale storm watches, electron-flux alerts and Type II radio emission alerts). The original NOAA message remains visible in the details.
+
+## Validation
+
+Unit tests cover 24-hour freshness, expired/future/cancelled records, missing timestamps, NOAA UTC timestamp parsing, SWPC active-warning state and the common SWPC product-code descriptions.

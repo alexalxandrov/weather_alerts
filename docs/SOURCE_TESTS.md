@@ -72,3 +72,32 @@ HTTP 200 alone is not success. The result must have the expected format before t
 - EMSC FDSN API documentation: https://www.seismicportal.eu/fdsnws/event/1/redoc
 - MeteoAlarm country feed directory: https://feeds.meteoalarm.org/
 - USGS real-time feeds: https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php
+
+
+## Current-alert rules and cache behavior (0.3.0)
+
+- An event needs a parseable issue/event/effective timestamp no older than 24 hours. Missing timestamps are treated as unknown and excluded; receipt time is not substituted.
+- Future effective alerts, already-expired records, cancellations/test messages, SWPC summaries and SWPC bulletins with "Active Warning: NO" are excluded from the visible journal and notifications.
+- The journal is a separate table from the source cache and seen-event IDs. It only receives the first active appearance of an event ID.
+- Refreshing an event updates its cache row. If the event already exists in the journal, its displayed information is updated without another notification.
+- Clearing the journal removes only visible journal rows. The cache and seen IDs remain, so the same still-active event cannot repopulate the cleared journal.
+- The cache expires records after 24 hours and prunes oldest entries until estimated payload storage is no greater than 10 MB. Cleanup runs during sync and active-journal loads.
+- On upgrade from database version 1, existing journal IDs are inserted into seen history before the user can clear the upgraded journal.
+- Both manual sync and the WorkManager background worker call the same AlertEngine.sync() ingestion path. The worker records its last execution time, newly added active count and last error in local preferences.
+- WorkManager schedules a periodic run with a 15-minute minimum interval. Android battery optimization/Doze may defer it; this is not guaranteed 15-minute delivery.
+
+## NOAA Space Weather decoding
+
+The SWPC feed is parsed separately from generic JSON. Summary products are not presented as active alerts. Common codes receive readable titles:
+- ALTKxx / WARKxx: observed or expected geomagnetic K-index threshold.
+- WATA20 / 30 / 50 / 99: predicted G1 / G2 / G3 / G4-or-greater geomagnetic storm watch.
+- ALTEF3: energetic electron flux alert (satellite charging risk).
+- ALTTP2: Type II solar radio emission (possible CME/shock).
+- ALTP* / WARP*: solar proton/radiation-storm alert or warning.
+- Other alert/watch/warning codes use the readable NOAA bulletin description line and retain the raw code in the details.
+
+The original NOAA bulletin text is retained as event detail. The issue time is used for the 24-hour freshness test; explicit end/expiry times and the "Active Warning" field are applied when present.
+
+## 0.3 unit test cases
+
+The test suite covers fresh vs older-than-24-hour events, expiration, future effective time, cancellations, missing timestamps, NOAA date parsing and SWPC code descriptions.
